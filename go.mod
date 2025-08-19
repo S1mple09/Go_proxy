@@ -5,7 +5,6 @@ require (
 	github.com/PuerkitoBio/goquery v1.8.1
 	github.com/sirupsen/logrus v1.9.3
 	golang.org/x/net v0.17.0
-	h12.io/socks v1.0.3
 )
 
 require (

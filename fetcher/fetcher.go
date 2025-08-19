@@ -11,8 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/PuerkitoBio/goquery"
 	"go_proxy/proxy"
+
+	"github.com/PuerkitoBio/goquery"
 )
 
 // ProxySource 代理源结构体
@@ -52,8 +53,9 @@ var proxySources = []ProxySource{
 // 使用goroutine并发请求所有代理源提高获取速度
 // 自动去重相同地址的代理
 // 返回值：
-//   []*proxy.Proxy: 去重后的代理列表
-//   error: 如果所有源都获取失败返回错误
+//
+//	[]*proxy.Proxy: 去重后的代理列表
+//	error: 如果所有源都获取失败返回错误
 func FetchAllProxies() ([]*proxy.Proxy, error) {
 	var wg sync.WaitGroup
 	proxyChan := make(chan []*proxy.Proxy, len(proxySources))
@@ -148,6 +150,9 @@ func parseAPIResponse(body io.Reader, protocol string) ([]*proxy.Proxy, error) {
 			proxies[i] = &proxy.Proxy{
 				Address:  fmt.Sprintf("%s:%d", item.Ip, item.Port),
 				Protocol: protocol,
+				Country:  "",
+				Province: "",
+				City:     "",
 			}
 		}
 		return proxies, nil
@@ -163,6 +168,9 @@ func parseAPIResponse(body io.Reader, protocol string) ([]*proxy.Proxy, error) {
 			proxies = append(proxies, &proxy.Proxy{
 				Address:  line,
 				Protocol: protocol,
+				Country:  "",
+				Province: "",
+				City:     "",
 			})
 		}
 	}
@@ -191,6 +199,9 @@ func parseHTMLResponse(body io.Reader, protocol string) ([]*proxy.Proxy, error) 
 			proxies = append(proxies, &proxy.Proxy{
 				Address:  match,
 				Protocol: protocol,
+				Country:  "",
+				Province: "",
+				City:     "",
 			})
 		}
 	})

@@ -1,18 +1,20 @@
 package checker
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"go_proxy/proxy"
+
 	xproxy "golang.org/x/net/proxy"
 )
 
@@ -57,10 +59,18 @@ func (c *Checker) InitializePublicIP() error {
 // CheckConnectivityAndSpeed 检查代理的连通性、响应速度和匿名度
 // 参数 p 是要检查的代理对象
 // 返回值：
-//   float64: 延迟时间（秒）
-//   string: 匿名级别（"Elite", "Anonymous" 或 "Transparent"）
-//   error: 如果检查失败返回错误信息
+//
+//	float64: 延迟时间（秒）
+//	string: 匿名级别（"Elite", "Anonymous" 或 "Transparent"）
+//	error: 如果检查失败返回错误信息
 func (c *Checker) CheckConnectivityAndSpeed(p *proxy.Proxy) (float64, string, error) {
+	// 计算代理评分
+	c.calculateScore(p)
+	return c.checkProxy(p)
+}
+
+// checkProxy 实际执行代理检查的内部方法
+func (c *Checker) checkProxy(p *proxy.Proxy) (float64, string, error) {
 	client, err := c.createProxyClient(p)
 	if err != nil {
 		return 0, "", err
@@ -92,7 +102,7 @@ func (c *Checker) CheckConnectivityAndSpeed(p *proxy.Proxy) (float64, string, er
 }
 
 // BatchLookupLocations 批量查询代理IP的地理位置信息
-// 使用 ipinfo.io 的批量API提高查询效率
+// 使用本地IP查询API获取国家/省份/城市信息
 // 参数 proxies 是需要查询的代理列表
 // 返回错误如果API调用失败
 func (c *Checker) BatchLookupLocations(proxies []*proxy.Proxy) error {
@@ -100,63 +110,43 @@ func (c *Checker) BatchLookupLocations(proxies []*proxy.Proxy) error {
 		return nil
 	}
 
-	ipMap := make(map[string][]*proxy.Proxy)
-	var ips []string
+	client := &http.Client{Timeout: 5 * time.Second}
 	for _, p := range proxies {
 		ip := strings.Split(p.Address, ":")[0]
-		if _, exists := ipMap[ip]; !exists {
-			ips = append(ips, ip)
-		}
-		ipMap[ip] = append(ipMap[ip], p)
-	}
+		url := fmt.Sprintf("https://ip9.com.cn/get?ip=%s", ip)
 
-	for i := 0; i < len(ips); i += 100 {
-		end := i + 100
-		if end > len(ips) {
-			end = len(ips)
-		}
-		batch := ips[i:end]
-
-		jsonData, err := json.Marshal(batch)
+		resp, err := client.Get(url)
 		if err != nil {
-			return err
-		}
-
-		req, err := http.NewRequest("POST", "https://ipinfo.io/batch", bytes.NewBuffer(jsonData))
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		client := &http.Client{Timeout: 30 * time.Second}
-		resp, err := client.Do(req)
-		if err != nil {
-			return err
+			continue
 		}
 		defer resp.Body.Close()
 
-		var results map[string]struct {
-			Country string `json:"country"`
-		}
-		if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
-			return err
+		var result struct {
+			Ret  int `json:"ret"`
+			Data struct {
+				Country string `json:"country"`
+				Prov    string `json:"prov"`
+				City    string `json:"city"`
+			} `json:"data"`
 		}
 
-		for ip, data := range results {
-			if relatedProxies, ok := ipMap[ip]; ok {
-				for _, p := range relatedProxies {
-					p.Location = data.Country
-				}
-			}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			continue
+		}
+
+		if result.Ret == 200 {
+			p.Country = result.Data.Country
+			p.Province = result.Data.Prov
+			p.City = result.Data.City
 		}
 	}
 	return nil
 }
 
 // checkSpeed 测试代理的下载速度
-// 通过下载100KB测试文件计算速度（Mbps）
+// 通过下载100KB测试文件计算速度（KB/s）
 // 参数 client 是配置好代理的HTTP客户端
-// 返回速度（Mbps）和可能的错误
+// 返回速度（KB/s）和可能的错误
 func (c *Checker) checkSpeed(client *http.Client) (float64, error) {
 	startTime := time.Now()
 	resp, err := client.Get("http://cachefly.cachefly.net/100kb.test")
@@ -175,10 +165,48 @@ func (c *Checker) checkSpeed(client *http.Client) (float64, error) {
 		return 0, errors.New("测试时间过短")
 	}
 
-	sizeMB := float64(len(data)) / (1024 * 1024)
-	speedMbps := (sizeMB * 8) / duration
+	// 转换为KB/s
+	speedKBps := float64(len(data)) / 1024 / duration
+	return speedKBps, nil
+}
 
-	return speedMbps, nil
+// calculateScore 计算代理综合评分
+// 延迟权重40%，速度权重40%，匿名度权重20%
+func (c *Checker) calculateScore(p *proxy.Proxy) {
+	p.LastChecked = time.Now()
+
+	// 计算各项评分
+	latencyScore := (1 - math.Min(p.Latency/5, 1)) * 40
+	speedScore := math.Min(p.Speed/1000, 1) * 40
+	anonymityScore := 0.0
+	switch p.Anonymity {
+	case "Elite":
+		anonymityScore = 20
+	case "Anonymous":
+		anonymityScore = 10
+	}
+
+	// 考虑失败次数惩罚
+	failPenalty := float64(p.FailCount) * 5
+	p.Score = math.Max(0, latencyScore+speedScore+anonymityScore-failPenalty)
+}
+
+// ConcurrentCheck 并发验证代理列表
+// workers参数控制最大并发数
+func (c *Checker) ConcurrentCheck(proxies []*proxy.Proxy, workers int) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, workers)
+
+	for _, p := range proxies {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(proxy *proxy.Proxy) {
+			defer wg.Done()
+			c.CheckConnectivityAndSpeed(proxy)
+			<-sem
+		}(p)
+	}
+	wg.Wait()
 }
 
 // createProxyClient 创建配置了指定代理的HTTP客户端

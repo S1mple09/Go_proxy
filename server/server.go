@@ -2,11 +2,15 @@ package server
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,9 +28,11 @@ type Server struct {
 	rotator    *proxy.Rotator
 	logger     *logrus.Logger
 
-	listener net.Listener
-	running  bool
-	mutex    sync.Mutex
+	listener     net.Listener
+	running      bool
+	mutex        sync.Mutex
+	healthTicker *time.Ticker
+	healthStop   chan struct{}
 }
 
 // NewServer 创建新的代理服务实例
@@ -79,8 +85,100 @@ func (s *Server) Stop() error {
 	if err := s.listener.Close(); err != nil {
 		s.logger.Errorf("关闭SOCKS5监听器错误: %v", err)
 	}
+	if s.healthTicker != nil {
+		s.healthTicker.Stop()
+		close(s.healthStop)
+	}
 	s.logger.Info("SOCKS5代理服务已停止")
 	return nil
+}
+
+// StartHealthChecks 启动代理健康检查
+// interval: 检查间隔时间
+func (s *Server) StartHealthChecks(interval time.Duration) {
+	s.healthTicker = time.NewTicker(interval)
+	s.healthStop = make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-s.healthTicker.C:
+				s.checkAllProxies()
+			case <-s.healthStop:
+				return
+			}
+		}
+	}()
+}
+
+// createProxyClient 创建配置了指定代理的HTTP客户端
+func (s *Server) createProxyClient(p *proxy.Proxy) (*http.Client, error) {
+	proxyURL, err := url.Parse(fmt.Sprintf("%s://%s", strings.ToLower(p.Protocol), p.Address))
+	if err != nil {
+		return nil, err
+	}
+
+	var transport *http.Transport
+	switch strings.ToLower(p.Protocol) {
+	case "http", "https":
+		transport = &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+	case "socks5", "socks4":
+		dialer, err := xproxy.FromURL(proxyURL, xproxy.Direct)
+		if err != nil {
+			return nil, err
+		}
+		transport = &http.Transport{Dial: dialer.Dial}
+	default:
+		return nil, errors.New("不支持的代理协议: " + p.Protocol)
+	}
+
+	return &http.Client{Transport: transport, Timeout: 10 * time.Second}, nil
+}
+
+// checkProxy 检查单个代理的健康状态
+func (s *Server) checkProxy(p *proxy.Proxy) (float64, string, error) {
+	client, err := s.createProxyClient(p)
+	if err != nil {
+		return 0, "", err
+	}
+
+	startTime := time.Now()
+	resp, err := client.Get("http://httpbin.org/get")
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	latency := time.Since(startTime).Seconds()
+
+	var data map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return latency, "", err
+	}
+
+	headers, _ := data["headers"].(map[string]interface{})
+	forwardedFor, _ := headers["X-Forwarded-For"].(string)
+	anonymity := "Elite"
+	if forwardedFor != "" {
+		anonymity = "Anonymous"
+	}
+
+	return latency, anonymity, nil
+}
+
+// checkAllProxies 检查所有代理的健康状态
+func (s *Server) checkAllProxies() {
+	proxies, err := s.rotator.GetValidProxies()
+	if err != nil {
+		s.logger.Errorf("获取有效代理失败: %v", err)
+		return
+	}
+	for _, p := range proxies {
+		if _, _, err := s.checkProxy(p); err != nil {
+			p.FailCount++
+		} else {
+			p.FailCount = 0
+		}
+	}
+	s.rotator.CleanupProxies(24 * time.Hour)
 }
 
 // acceptConnections 循环接受客户端连接

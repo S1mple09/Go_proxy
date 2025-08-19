@@ -33,10 +33,15 @@ type App struct {
 	server  *server.Server
 
 	// UI 组件的数据绑定
-	proxyList     binding.UntypedList
-	logBinding    binding.String
-	progressBar   *widget.ProgressBar
-	serverRunning binding.Bool
+	proxyList       binding.UntypedList
+	logBinding      binding.String
+	progressBar     *widget.ProgressBar
+	serverRunning   binding.Bool
+	rotationStatus  binding.Bool
+	currentProxy    binding.String
+	rotationTicker  *time.Ticker
+	rotationStop    chan struct{}
+	rotationSeconds int
 
 	// 筛选条件
 	maxLatency float64
@@ -48,7 +53,7 @@ func NewApp() *App {
 	a := &App{}
 	a.fyneApp = app.New()
 	a.fyneApp.Settings().SetTheme(&theme.MyTheme{})
-	a.win = a.fyneApp.NewWindow("高可用代理池 vO.0")
+	a.win = a.fyneApp.NewWindow("代理池工具 v0.1")
 
 	a.rotator = proxy.NewRotator()
 	a.checker = checker.NewChecker()
@@ -58,6 +63,12 @@ func NewApp() *App {
 	a.progressBar = widget.NewProgressBar()
 	a.serverRunning = binding.NewBool()
 	a.serverRunning.Set(false)
+	a.rotationStatus = binding.NewBool()
+	a.rotationStatus.Set(false)
+	a.currentProxy = binding.NewString()
+	a.currentProxy.Set("无")
+	a.rotationSeconds = 60
+	a.rotationStop = make(chan struct{})
 
 	// 默认不筛选
 	a.maxLatency = -1
@@ -107,7 +118,11 @@ func (a *App) FetchProxies() {
 // TestAllProxies 高并发测试所有原始代理，并将有效代理存入列表
 func (a *App) TestAllProxies() {
 	go func() {
-		rawProxies := a.rotator.GetRawProxies()
+		rawProxies, err := a.rotator.GetRawProxies()
+		if err != nil {
+			a.Log(fmt.Sprintf("获取原始代理失败: %v", err))
+			return
+		}
 		if len(rawProxies) == 0 {
 			a.Log("没有可测试的代理，请先获取代理。")
 			return
@@ -115,7 +130,10 @@ func (a *App) TestAllProxies() {
 		a.Log(fmt.Sprintf("开始并发测试 %d 个代理...", len(rawProxies)))
 		a.progressBar.Show()
 		a.progressBar.SetValue(0)
-		a.rotator.SetValidProxies([]*proxy.Proxy{}) // 开始测试前清空有效列表
+		if err := a.rotator.SetValidProxies([]*proxy.Proxy{}); err != nil { // 开始测试前清空有效列表
+			a.Log(fmt.Sprintf("清空有效代理失败: %v", err))
+			return
+		}
 		a.ApplyFiltersAndRefresh()
 
 		var wg sync.WaitGroup
@@ -135,7 +153,9 @@ func (a *App) TestAllProxies() {
 				}()
 				if _, _, err := a.checker.CheckConnectivityAndSpeed(pr); err == nil {
 					// 测试成功，立即添加到有效列表并刷新UI
-					a.rotator.AddValidProxies([]*proxy.Proxy{pr})
+					if err := a.rotator.AddValidProxies([]*proxy.Proxy{pr}); err != nil {
+						a.Log(fmt.Sprintf("添加有效代理失败: %v", err))
+					}
 					a.ApplyFiltersAndRefresh()
 				}
 				testedMutex.Lock()
@@ -149,7 +169,11 @@ func (a *App) TestAllProxies() {
 		a.Log("基础测试完成。开始后台批量查询地理位置...")
 		// 后台批量查询地理位置，不阻塞主流程
 		go func() {
-			validProxies := a.rotator.GetValidProxies()
+			validProxies, err := a.rotator.GetValidProxies()
+			if err != nil {
+				a.Log(fmt.Sprintf("获取有效代理失败: %v", err))
+				return
+			}
 			if len(validProxies) > 0 {
 				if err := a.checker.BatchLookupLocations(validProxies); err != nil {
 					a.Log(fmt.Sprintf("批量查询地理位置失败: %v", err))
@@ -197,7 +221,11 @@ func (a *App) ApplyFilters(maxLatencyStr, minSpeedStr string) {
 
 // ApplyFiltersAndRefresh 从rotator获取、筛选、排序并更新UI
 func (a *App) ApplyFiltersAndRefresh() {
-	proxies := a.rotator.GetFilteredAndSortedProxies(a.maxLatency, a.minSpeed)
+	proxies, err := a.rotator.GetFilteredAndSortedProxies(a.maxLatency, a.minSpeed)
+	if err != nil {
+		a.Log(fmt.Sprintf("获取筛选代理失败: %v", err))
+		return
+	}
 	var proxyItems []interface{}
 	for _, p := range proxies {
 		proxyItems = append(proxyItems, p)
@@ -232,7 +260,11 @@ func (a *App) ImportProxies() {
 
 // ExportProxies 导出当前显示的有效代理到文件
 func (a *App) ExportProxies() {
-	proxies := a.rotator.GetFilteredAndSortedProxies(a.maxLatency, a.minSpeed)
+	proxies, err := a.rotator.GetFilteredAndSortedProxies(a.maxLatency, a.minSpeed)
+	if err != nil {
+		a.Log(fmt.Sprintf("获取代理失败: %v", err))
+		return
+	}
 	if len(proxies) == 0 {
 		dialog.ShowInformation("无代理可导出", "当前列表没有可导出的有效代理。", a.win)
 		return
@@ -319,3 +351,59 @@ func (a *App) GetProxyList() binding.UntypedList   { return a.proxyList }
 func (a *App) GetLogBinding() binding.String       { return a.logBinding }
 func (a *App) GetProgressBar() *widget.ProgressBar { return a.progressBar }
 func (a *App) GetServerStatus() binding.Bool       { return a.serverRunning }
+func (a *App) GetRotationStatus() binding.Bool     { return a.rotationStatus }
+func (a *App) GetCurrentProxy() binding.String     { return a.currentProxy }
+
+// ToggleRotation 切换代理轮换状态
+func (a *App) ToggleRotation(enable bool) {
+	if enable {
+		a.startRotation()
+	} else {
+		a.stopRotation()
+	}
+}
+
+// SetRotationInterval 设置轮换间隔时间(秒)
+func (a *App) SetRotationInterval(seconds int) {
+	if seconds <= 0 {
+		return
+	}
+	a.rotationSeconds = seconds
+	a.Log(fmt.Sprintf("轮换间隔已设置为 %d 秒", seconds))
+	if running, _ := a.rotationStatus.Get(); running {
+		a.stopRotation()
+		a.startRotation()
+	}
+}
+
+// startRotation 开始代理轮换
+func (a *App) startRotation() {
+	a.rotationStatus.Set(true)
+	a.rotationTicker = time.NewTicker(time.Duration(a.rotationSeconds) * time.Second)
+	go func() {
+		for {
+			select {
+			case <-a.rotationTicker.C:
+				proxy := a.rotator.GetNextProxy("", false)
+				if proxy != nil {
+					a.currentProxy.Set(proxy.Address)
+					a.Log(fmt.Sprintf("已轮换到新代理: %s", proxy.Address))
+				}
+			case <-a.rotationStop:
+				return
+			}
+		}
+	}()
+	a.Log(fmt.Sprintf("代理轮换已启动，间隔 %d 秒", a.rotationSeconds))
+}
+
+// stopRotation 停止代理轮换
+func (a *App) stopRotation() {
+	a.rotationStatus.Set(false)
+	if a.rotationTicker != nil {
+		a.rotationTicker.Stop()
+	}
+	close(a.rotationStop)
+	a.rotationStop = make(chan struct{})
+	a.Log("代理轮换已停止")
+}
