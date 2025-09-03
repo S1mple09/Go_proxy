@@ -28,7 +28,7 @@ go_proxy 是一个用 Go 语言开发的高性能代理池管理系统，支持�
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/go_proxy.git
+git clone https://github.com/S1mple/go_proxy.git
 cd go_proxy
 
 # 初始化模块并安装依赖
