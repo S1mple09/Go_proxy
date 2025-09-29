@@ -131,14 +131,24 @@ func (r *Rotator) GetValidProxyCount() int {
 
 // CleanupProxies 清理失效代理
 // 移除超过最大失败次数或长时间未检查的代理
+// 实现指数退避策略：失败次数越多，下次检查间隔越长
 func (r *Rotator) CleanupProxies(maxAge time.Duration) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
 	var valid []*Proxy
 	for _, p := range r.validProxies {
-		if p.FailCount < 5 && // maxFailCount hardcoded as 5 for now
-			time.Since(p.LastChecked) <= maxAge {
+		// 计算指数退避时间 (2^failCount 分钟)
+		backoffTime := time.Duration(1<<uint(p.FailCount)) * time.Minute
+		nextCheckTime := p.LastChecked.Add(backoffTime)
+
+		// 保留代理条件：
+		// 1. 失败次数小于5次
+		// 2. 未超过最大年龄限制
+		// 3. 已超过退避时间或从未失败过
+		if p.FailCount < 5 &&
+			time.Since(p.LastChecked) <= maxAge &&
+			(p.FailCount == 0 || time.Now().After(nextCheckTime)) {
 			valid = append(valid, p)
 		}
 	}

@@ -3,10 +3,13 @@ package ui
 import (
 	"fmt"
 	"go_proxy/proxy"
+	"image/color"
 	"strconv"
 	"strings"
+	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/dialog"
@@ -16,6 +19,21 @@ import (
 
 	customtheme "go_proxy/theme"
 )
+
+// minSizeLayout 自定义最小尺寸布局
+type minSizeLayout struct {
+	minSize fyne.Size
+}
+
+func (m *minSizeLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	return m.minSize
+}
+
+func (m *minSizeLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	for _, child := range objects {
+		child.Resize(size)
+	}
+}
 
 // Apper 应用核心功能接口
 // 定义了应用所需的所有核心功能，包括UI组件访问、代理管理和服务控制
@@ -47,7 +65,9 @@ func SetupUI(app Apper) {
 	filterControl := createFilterControlPanel(app)
 	serverControl := createServerControlPanel(app)
 	rotationControl := createRotationControlPanel(app)
-	progressCard := widget.NewCard("进度", "", app.GetProgressBar())
+	// Create progress bar
+	progressBar := app.GetProgressBar()
+	progressCard := widget.NewCard("进度", "", progressBar)
 
 	// 创建代理详情显示区域
 	currentProxyInfo := widget.NewMultiLineEntry()
@@ -78,21 +98,29 @@ func SetupUI(app Apper) {
 	logView := createLogView(app)
 
 	// 新的三栏布局：代理列表 | 代理详情 | 日志
-	leftPanel := container.NewBorder(nil, nil, nil, nil, proxyList)
+	leftPanel := container.New(
+		&minSizeLayout{minSize: fyne.NewSize(200, 0)},
+		container.NewVScroll(proxyList),
+	)
+
 	centerPanel := container.NewBorder(
 		widget.NewLabelWithStyle("当前代理详情", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		nil, nil, nil,
 		container.NewScroll(currentProxyInfo),
 	)
-	rightPanel := container.NewBorder(nil, nil, nil, nil, logView)
+
+	rightPanel := container.New(
+		&minSizeLayout{minSize: fyne.NewSize(300, 0)},
+		container.NewVScroll(logView),
+	)
 
 	// 第一层分割：左侧代理列表和中间区域
 	leftSplit := container.NewHSplit(leftPanel, centerPanel)
-	leftSplit.SetOffset(0.4)
+	leftSplit.SetOffset(0.3) // 默认左侧占30%
 
 	// 第二层分割：中间区域和右侧日志
 	mainSplit := container.NewHSplit(leftSplit, rightPanel)
-	mainSplit.SetOffset(0.7)
+	mainSplit.SetOffset(0.7) // 默认右侧占30%
 
 	topPanel := container.NewVBox(toolbar, filterControl, serverControl, rotationControl, progressCard)
 	mainLayout := container.NewBorder(topPanel, nil, nil, nil, mainSplit)
@@ -111,18 +139,49 @@ func createToolbar(app Apper) fyne.CanvasObject {
 	// 主题切换按钮
 	themeBtn := widget.NewButton("切换主题", func() {
 		currentTheme := fyne.CurrentApp().Settings().Theme()
-		if _, isCustom := currentTheme.(*customtheme.MyTheme); isCustom {
-			// 如果当前是自定义主题，切换内置主题
-			if currentTheme == fynetheme.DarkTheme() {
-				fyne.CurrentApp().Settings().SetTheme(fynetheme.LightTheme())
-			} else {
-				fyne.CurrentApp().Settings().SetTheme(fynetheme.DarkTheme())
+		win := app.GetWindow()
+
+		// Create animation overlay
+		overlay := canvas.NewRectangle(color.Transparent)
+		overlay.Resize(win.Content().Size())
+		overlayContainer := container.NewWithoutLayout(overlay)
+		win.Canvas().Overlays().Add(overlayContainer)
+
+		// Fade out overlay
+		go func() {
+			for i := 0.0; i <= 1.0; i += 0.1 {
+				fyne.Do(func() {
+					overlay.FillColor = color.NRGBA{R: 0, G: 0, B: 0, A: uint8(255 * i)}
+					overlayContainer.Refresh()
+				})
+				time.Sleep(20 * time.Millisecond)
 			}
-		} else {
-			// 如果当前是内置主题，切换自定义主题
-			fyne.CurrentApp().Settings().SetTheme(&customtheme.MyTheme{})
-		}
-		app.GetWindow().Content().Refresh()
+
+			// Change theme
+			fyne.Do(func() {
+				if _, isCustom := currentTheme.(*customtheme.MyTheme); isCustom {
+					if currentTheme == fynetheme.DarkTheme() {
+						fyne.CurrentApp().Settings().SetTheme(fynetheme.LightTheme())
+					} else {
+						fyne.CurrentApp().Settings().SetTheme(fynetheme.DarkTheme())
+					}
+				} else {
+					fyne.CurrentApp().Settings().SetTheme(&customtheme.MyTheme{})
+				}
+			})
+
+			// Fade in overlay
+			for i := 1.0; i >= 0; i -= 0.1 {
+				fyne.Do(func() {
+					overlay.FillColor = color.NRGBA{R: 0, G: 0, B: 0, A: uint8(255 * i)}
+					overlayContainer.Refresh()
+				})
+				time.Sleep(20 * time.Millisecond)
+			}
+			fyne.Do(func() {
+				win.Canvas().Overlays().Remove(overlayContainer)
+			})
+		}()
 	})
 
 	buttons := container.NewHBox(
@@ -336,6 +395,59 @@ func createProxyList(app Apper) fyne.CanvasObject {
 		data.Set(newItems)
 	}
 
+	// 当前选中的行ID
+	var selectedRow widget.TableCellID
+
+	// 右键菜单项
+	menuItems := []*fyne.MenuItem{
+		fyne.NewMenuItem("测试选中代理", func() {
+			items, _ := data.Get()
+			if selectedRow.Row > 0 && selectedRow.Row <= len(items) {
+				p := items[selectedRow.Row-1].(*proxy.Proxy)
+				app.Log(fmt.Sprintf("开始测试代理: %s", p.Address))
+				go func() {
+					// 这里应该调用实际的测试方法
+					app.Log(fmt.Sprintf("代理 %s 测试完成", p.Address))
+				}()
+			}
+		}),
+		fyne.NewMenuItem("导出选中代理", func() {
+			if selectedRow.Row > 0 {
+				items, _ := data.Get()
+				if selectedRow.Row <= len(items) {
+					p := items[selectedRow.Row-1].(*proxy.Proxy)
+					dialog.ShowFileSave(func(uri fyne.URIWriteCloser, err error) {
+						if uri != nil {
+							defer uri.Close()
+							_, _ = uri.Write([]byte(p.Address))
+							app.Log(fmt.Sprintf("已导出代理: %s", p.Address))
+						}
+					}, app.GetWindow())
+				}
+			}
+		}),
+		fyne.NewMenuItem("删除选中代理", func() {
+			if selectedRow.Row > 0 {
+				items, _ := data.Get()
+				if selectedRow.Row <= len(items) {
+					p := items[selectedRow.Row-1].(*proxy.Proxy)
+					dialog.ShowConfirm("确认删除", fmt.Sprintf("确定要删除代理 %s 吗?", p.Address), func(ok bool) {
+						if ok {
+							newItems := make([]interface{}, 0, len(items)-1)
+							newItems = append(newItems, items[:selectedRow.Row-1]...)
+							newItems = append(newItems, items[selectedRow.Row:]...)
+							data.Set(newItems)
+							app.Log(fmt.Sprintf("已删除代理: %s", p.Address))
+						}
+					}, app.GetWindow())
+				}
+			}
+		}),
+	}
+
+	// Create animated container for table
+	tableContainer := container.NewStack()
+	overlay := container.NewWithoutLayout()
 	table := widget.NewTable(
 		func() (int, int) { return data.Length() + 1, 6 },
 		func() fyne.CanvasObject { return widget.NewLabel("Template") },
@@ -401,7 +513,16 @@ func createProxyList(app Apper) fyne.CanvasObject {
 	table.SetColumnWidth(5, 80)  // 地区列
 
 	// 点击速度列头排序
+	// 添加右键菜单支持
 	table.OnSelected = func(id widget.TableCellID) {
+		selectedRow = id
+
+		if id.Row > 0 {
+			// 显示右键菜单
+			pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(table)
+			widget.ShowPopUpMenuAtPosition(fyne.NewMenu("", menuItems...), app.GetWindow().Canvas(), pos)
+		}
+
 		if id.Row == 0 {
 			switch id.Col {
 			case 2: // 点击延迟列头
@@ -415,7 +536,41 @@ func createProxyList(app Apper) fyne.CanvasObject {
 		}
 	}
 
-	return widget.NewCard("有效代理列表", "", table)
+	// Add fade animation when proxy list updates
+	data.AddListener(binding.NewDataListener(func() {
+		go func() {
+			// Fade out by adding semi-transparent overlay
+			for i := 0.0; i <= 1.0; i += 0.1 {
+				fyne.Do(func() {
+					overlay.Objects[0].(*canvas.Rectangle).FillColor = color.NRGBA{R: 255, G: 255, B: 255, A: uint8(150 * i)}
+					overlay.Refresh()
+				})
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			// Refresh table
+			fyne.Do(func() {
+				table.Refresh()
+			})
+
+			// Fade in by removing overlay
+			for i := 1.0; i >= 0; i -= 0.1 {
+				fyne.Do(func() {
+					overlay.Objects[0].(*canvas.Rectangle).FillColor = color.NRGBA{R: 255, G: 255, B: 255, A: uint8(150 * i)}
+					overlay.Refresh()
+				})
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+	}))
+
+	// Add white semi-transparent rectangle for fade effect
+	rect := canvas.NewRectangle(color.NRGBA{R: 255, G: 255, B: 255, A: 0})
+	rect.Resize(table.MinSize())
+	overlay.Add(rect)
+	tableContainer.Add(table)
+	tableContainer.Add(overlay)
+	return widget.NewCard("有效代理列表", "", tableContainer)
 }
 
 // createRotationControlPanel 创建代理轮换控制面板

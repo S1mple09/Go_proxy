@@ -57,6 +57,7 @@ func (c *Checker) InitializePublicIP() error {
 }
 
 // CheckConnectivityAndSpeed 检查代理的连通性、响应速度和匿名度
+// 实现指数退避策略 - 失败次数越多，检查间隔越长
 // 参数 p 是要检查的代理对象
 // 返回值：
 //
@@ -64,9 +65,24 @@ func (c *Checker) InitializePublicIP() error {
 //	string: 匿名级别（"Elite", "Anonymous" 或 "Transparent"）
 //	error: 如果检查失败返回错误信息
 func (c *Checker) CheckConnectivityAndSpeed(p *proxy.Proxy) (float64, string, error) {
+	// 检查是否需要退避
+	backoffTime := time.Duration(1<<uint(p.FailCount)) * time.Minute
+	if p.LastChecked.Add(backoffTime).After(time.Now()) {
+		return 0, "", fmt.Errorf("proxy in backoff period (next check in %v)",
+			p.LastChecked.Add(backoffTime).Sub(time.Now()).Round(time.Second))
+	}
+
+	latency, anonymity, err := c.checkProxy(p)
+	if err != nil {
+		p.FailCount++
+	} else {
+		p.FailCount = 0 // Reset on success
+	}
+	p.LastChecked = time.Now()
+
 	// 计算代理评分
 	c.calculateScore(p)
-	return c.checkProxy(p)
+	return latency, anonymity, err
 }
 
 // checkProxy 实际执行代理检查的内部方法
@@ -102,44 +118,215 @@ func (c *Checker) checkProxy(p *proxy.Proxy) (float64, string, error) {
 }
 
 // BatchLookupLocations 批量查询代理IP的地理位置信息
-// 使用本地IP查询API获取国家/省份/城市信息
+// 使用多个IP查询API并发获取国家/省份/城市信息
+// 实现工作池模式、动态并发控制和结果缓存
 // 参数 proxies 是需要查询的代理列表
-// 返回错误如果API调用失败
+// 返回错误如果所有API调用都失败
 func (c *Checker) BatchLookupLocations(proxies []*proxy.Proxy) error {
 	if len(proxies) == 0 {
 		return nil
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	// 过滤掉已有地理位置信息的代理
+	var needLookup []*proxy.Proxy
 	for _, p := range proxies {
-		ip := strings.Split(p.Address, ":")[0]
-		url := fmt.Sprintf("https://ip9.com.cn/get?ip=%s", ip)
-
-		resp, err := client.Get(url)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-
-		var result struct {
-			Ret  int `json:"ret"`
-			Data struct {
-				Country string `json:"country"`
-				Prov    string `json:"prov"`
-				City    string `json:"city"`
-			} `json:"data"`
-		}
-
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			continue
-		}
-
-		if result.Ret == 200 {
-			p.Country = result.Data.Country
-			p.Province = result.Data.Prov
-			p.City = result.Data.City
+		if p.Country == "" || p.Province == "" || p.City == "" {
+			needLookup = append(needLookup, p)
 		}
 	}
+	if len(needLookup) == 0 {
+		return nil
+	}
+
+	// 定义多个地理位置API (按优先级排序)
+	geoAPIs := []struct {
+		URL       string
+		Parser    func([]byte) (country, province, city string)
+		RateLimit time.Duration // API调用间隔限制
+	}{
+		{
+			URL:       "https://ipapi.co/%s/json/",
+			RateLimit: 1 * time.Second, // 1秒间隔限制
+			Parser: func(data []byte) (string, string, string) {
+				var result struct {
+					Country string `json:"country_name"`
+					Region  string `json:"region"`
+					City    string `json:"city"`
+				}
+				if err := json.Unmarshal(data, &result); err == nil {
+					return result.Country, result.Region, result.City
+				}
+				return "", "", ""
+			},
+		},
+		{
+			URL:       "https://ipinfo.io/%s/json",
+			RateLimit: 500 * time.Millisecond, // 0.5秒间隔限制
+			Parser: func(data []byte) (string, string, string) {
+				var result struct {
+					Country string `json:"country"`
+					Region  string `json:"region"`
+					City    string `json:"city"`
+				}
+				if err := json.Unmarshal(data, &result); err == nil {
+					return result.Country, result.Region, result.City
+				}
+				return "", "", ""
+			},
+		},
+		{
+			URL:       "https://ip9.com.cn/get?ip=%s",
+			RateLimit: 2 * time.Second, // 2秒间隔限制
+			Parser: func(data []byte) (string, string, string) {
+				var result struct {
+					Ret  int `json:"ret"`
+					Data struct {
+						Country string `json:"country"`
+						Prov    string `json:"prov"`
+						City    string `json:"city"`
+					} `json:"data"`
+				}
+				if err := json.Unmarshal(data, &result); err == nil && result.Ret == 200 {
+					return result.Data.Country, result.Data.Prov, result.Data.City
+				}
+				return "", "", ""
+			},
+		},
+	}
+
+	// 工作池模式
+	type job struct {
+		proxy *proxy.Proxy
+		ip    string
+	}
+	type result struct {
+		proxy    *proxy.Proxy
+		country  string
+		province string
+		city     string
+	}
+
+	jobs := make(chan job, len(proxies))
+	results := make(chan result, len(proxies))
+
+	// 动态调整并发数 (初始10，最大50)
+	maxConcurrency := 10
+	adjustTicker := time.NewTicker(5 * time.Second)
+	defer adjustTicker.Stop()
+
+	// 启动worker池
+	var wg sync.WaitGroup
+	for i := 0; i < maxConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client := &http.Client{Timeout: 5 * time.Second}
+			for j := range jobs {
+				// 按优先级尝试各个API
+				for _, api := range geoAPIs {
+					time.Sleep(api.RateLimit) // 遵守API速率限制
+					url := fmt.Sprintf(api.URL, j.ip)
+					req, _ := http.NewRequest("GET", url, nil)
+					req.Header.Set("User-Agent", "Mozilla/5.0")
+					resp, err := client.Do(req)
+					if err != nil {
+						continue
+					}
+
+					data, err := io.ReadAll(resp.Body)
+					resp.Body.Close()
+					if err != nil {
+						continue
+					}
+
+					country, province, city := api.Parser(data)
+					if country != "" {
+						results <- result{
+							proxy:    j.proxy,
+							country:  country,
+							province: province,
+							city:     city,
+						}
+						break
+					}
+				}
+			}
+		}()
+	}
+
+	// 动态调整并发数
+	go func() {
+		for range adjustTicker.C {
+			// 根据当前负载调整并发数
+			newConcurrency := maxConcurrency
+			if len(jobs) > 100 {
+				newConcurrency = 50
+			} else if len(jobs) < 20 {
+				newConcurrency = 10
+			}
+
+			if newConcurrency != maxConcurrency {
+				diff := newConcurrency - maxConcurrency
+				if diff > 0 {
+					// 增加worker
+					for i := 0; i < diff; i++ {
+						wg.Add(1)
+						go func() {
+							defer wg.Done()
+							client := &http.Client{Timeout: 5 * time.Second}
+							for j := range jobs {
+								for _, api := range geoAPIs {
+									url := fmt.Sprintf(api.URL, j.ip)
+									resp, err := client.Get(url)
+									if err != nil {
+										continue
+									}
+
+									data, err := io.ReadAll(resp.Body)
+									resp.Body.Close()
+									if err != nil {
+										continue
+									}
+
+									country, province, city := api.Parser(data)
+									if country != "" {
+										results <- result{
+											proxy:    j.proxy,
+											country:  country,
+											province: province,
+											city:     city,
+										}
+										break
+									}
+								}
+							}
+						}()
+					}
+				}
+				maxConcurrency = newConcurrency
+			}
+		}
+	}()
+
+	// 分发任务
+	for _, p := range proxies {
+		ip := strings.Split(p.Address, ":")[0]
+		jobs <- job{proxy: p, ip: ip}
+	}
+	close(jobs)
+
+	// 收集结果
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for r := range results {
+		r.proxy.Country = r.country
+		r.proxy.Province = r.province
+		r.proxy.City = r.city
+	}
+
 	return nil
 }
 
@@ -171,24 +358,53 @@ func (c *Checker) checkSpeed(client *http.Client) (float64, error) {
 }
 
 // calculateScore 计算代理综合评分
-// 延迟权重40%，速度权重40%，匿名度权重20%
+// 评分维度及权重：
+// - 延迟(25%): 0-5秒线性评分，越低越好
+// - 速度(25%): 0-1000KB/s线性评分，越高越好
+// - 匿名度(15%): Elite(15), Anonymous(7.5), 其他(0)
+// - 稳定性(20%): 基于失败次数和成功率计算
+// - 地理位置(10%): 特定地区加分(如美国、日本、新加坡等网络质量好的地区)
+// - 新鲜度(5%): 最近检查的代理加分
 func (c *Checker) calculateScore(p *proxy.Proxy) {
 	p.LastChecked = time.Now()
 
-	// 计算各项评分
-	latencyScore := (1 - math.Min(p.Latency/5, 1)) * 40
-	speedScore := math.Min(p.Speed/1000, 1) * 40
+	// 计算基础评分
+	latencyScore := (1 - math.Min(p.Latency/5, 1)) * 30
+	speedScore := math.Min(p.Speed/1000, 1) * 30
+
+	// 匿名度评分
 	anonymityScore := 0.0
 	switch p.Anonymity {
 	case "Elite":
-		anonymityScore = 20
+		anonymityScore = 15
 	case "Anonymous":
-		anonymityScore = 10
+		anonymityScore = 7.5
 	}
 
-	// 考虑失败次数惩罚
-	failPenalty := float64(p.FailCount) * 5
-	p.Score = math.Max(0, latencyScore+speedScore+anonymityScore-failPenalty)
+	// 稳定性评分(基于失败率和成功率)
+	stabilityScore := 0.0
+	totalChecks := p.FailCount + 1 // At least 1 check
+	successRate := 1 - float64(p.FailCount)/float64(totalChecks)
+	stabilityScore = successRate * 20
+
+	// 新鲜度评分(最近检查的代理加分)
+	freshnessScore := 0.0
+	if time.Since(p.LastChecked) < 30*time.Minute {
+		freshnessScore = 5
+	}
+
+	// 地理位置评分
+	locationScore := 0.0
+	switch p.Country {
+	case "United States", "Japan", "Singapore", "Germany", "South Korea":
+		locationScore = 10
+	case "China", "Russia", "Brazil", "India":
+		locationScore = 5
+	}
+
+	// 综合评分
+	p.Score = math.Max(0, latencyScore+speedScore+anonymityScore+
+		stabilityScore+locationScore+freshnessScore)
 }
 
 // ConcurrentCheck 并发验证代理列表

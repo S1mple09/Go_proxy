@@ -53,7 +53,7 @@ func NewApp() *App {
 	a := &App{}
 	a.fyneApp = app.New()
 	a.fyneApp.Settings().SetTheme(&theme.MyTheme{})
-	a.win = a.fyneApp.NewWindow("代理池工具 v0.1")
+	a.win = a.fyneApp.NewWindow("代理池工具 v0.1.1")
 
 	a.rotator = proxy.NewRotator()
 	a.checker = checker.NewChecker()
