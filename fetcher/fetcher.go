@@ -27,26 +27,26 @@ type ProxySource struct {
 	IsAPI    bool
 }
 
-// proxySources 内置代理源列表
-// 包含16个免费代理源，覆盖HTTP/HTTPS/SOCKS4/SOCKS5协议
-// 混合使用API接口和HTML页面类型的数据源
-var proxySources = []ProxySource{
-	{"https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http", "http", true},
-	{"https://openproxylist.xyz/http.txt", "http", true},
-	{"https://www.proxy-list.download/api/v1/get?type=http", "http", true},
-	{"https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=http", "http", true},
-	{"https://free-proxy-list.net/", "http", false},
-	{"http://www.kxdaili.com/dailiip/1/1.html", "http", false},
-	{"http://www.66ip.cn/nmtq.php?get_num=300&isp=0&anonym=0&type=2", "http", true},
-	{"http://proxylist.fatezero.org/proxy.list", "http", false},
-	{"https://www.proxy-list.download/api/v1/get?type=https", "https", true},
-	{"https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=socks4", "socks4", true},
-	{"https://openproxylist.xyz/socks4.txt", "socks4", true},
-	{"https://www.proxy-list.download/api/v1/get?type=socks4", "socks4", true},
-	{"https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=socks5", "socks5", true},
-	{"https://openproxylist.xyz/socks5.txt", "socks5", true},
-	{"https://www.proxy-list.download/api/v1/get?type=socks5", "socks5", true},
-	{"https://www.proxyscan.io/api/proxy?type=socks5&format=txt", "socks5", true},
+// GetDefaultSources 返回一个包含内置代理源的列表
+func GetDefaultSources() []ProxySource {
+	return []ProxySource{
+		{"https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http", "http", true},
+		{"https://openproxylist.xyz/http.txt", "http", true},
+		{"https://www.proxy-list.download/api/v1/get?type=http", "http", true},
+		{"https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=http", "http", true},
+		{"https://free-proxy-list.net/", "http", false},
+		{"http://www.kxdaili.com/dailiip/1/1.html", "http", false},
+		{"http://www.66ip.cn/nmtq.php?get_num=300&isp=0&anonym=0&type=2", "http", true},
+		{"http://proxylist.fatezero.org/proxy.list", "http", false},
+		{"https://www.proxy-list.download/api/v1/get?type=https", "https", true},
+		{"https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=socks4", "socks4", true},
+		{"https://openproxylist.xyz/socks4.txt", "socks4", true},
+		{"https://www.proxy-list.download/api/v1/get?type=socks4", "socks4", true},
+		{"https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=socks5", "socks5", true},
+		{"https://openproxylist.xyz/socks5.txt", "socks5", true},
+		{"https://www.proxy-list.download/api/v1/get?type=socks5", "socks5", true},
+		{"https://www.proxyscan.io/api/proxy?type=socks5&format=txt", "socks5", true},
+	}
 }
 
 // FetchAllProxies 从所有代理源并发获取代理列表
@@ -56,12 +56,12 @@ var proxySources = []ProxySource{
 //
 //	[]*proxy.Proxy: 去重后的代理列表
 //	error: 如果所有源都获取失败返回错误
-func FetchAllProxies() ([]*proxy.Proxy, error) {
+func FetchAllProxies(sources []ProxySource) ([]*proxy.Proxy, error) {
 	var wg sync.WaitGroup
-	proxyChan := make(chan []*proxy.Proxy, len(proxySources))
-	errChan := make(chan error, len(proxySources))
+	proxyChan := make(chan []*proxy.Proxy, len(sources))
+	errChan := make(chan error, len(sources))
 
-	for _, source := range proxySources {
+	for _, source := range sources {
 		wg.Add(1)
 		go func(s ProxySource) {
 			defer wg.Done()

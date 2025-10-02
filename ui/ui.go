@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"go_proxy/fetcher"
 	"go_proxy/proxy"
 	"sort"
 	"strconv"
@@ -118,31 +119,8 @@ func createToolbar(app Apper) fyne.CanvasObject {
 		widget.NewButton("导入代理", app.ImportProxies),
 		widget.NewButton("导出代理", app.ExportProxies),
 		themeSelect, // 使用主题选择框
-		widget.NewButton("查询IP", func() {
-			ip := ipEntry.Text
-			if ip != "" {
-				go func() {
-					app.Log(fmt.Sprintf("正在查询IP: %s", ip))
-					location, err := queryIPCountry(ip)
-					if err != nil {
-						app.Log(fmt.Sprintf("查询IP失败: %v", err))
-						return
-					}
-					parts := strings.Split(location, "|")
-					if len(parts) == 3 {
-						country := parts[0]
-						province := parts[1]
-						city := parts[2]
-						app.Log(fmt.Sprintf("IP %s 位置: %s %s %s", ip, country, province, city))
-						// 更新当前代理的位置信息
-						currentProxy, _ := app.GetCurrentProxy().Get()
-						if currentProxy != "" {
-							// 这里需要app有方法更新代理的位置信息
-							app.Log(fmt.Sprintf("已更新代理 %s 的位置为 %s %s %s", currentProxy, country, province, city))
-						}
-					}
-				}()
-			}
+		widget.NewButton("管理代理源", func() {
+			createSourceManagementWindow(app)
 		}),
 		widget.NewButton("清空列表", func() {
 			dialog.ShowConfirm("确认", "确定要清空所有代理列表吗?", func(ok bool) {
@@ -179,6 +157,111 @@ func createFilterControlPanel(app Apper) fyne.CanvasObject {
 		widget.NewAccordionItem("筛选器", container.NewBorder(nil, nil, nil, applyBtn, grid)),
 	)
 	return accordion
+}
+
+func createSourceManagementWindow(app Apper) {
+	win := fyne.CurrentApp().NewWindow("代理源管理")
+	win.Resize(fyne.NewSize(800, 500))
+
+	// Cast app to SourceManager interface
+	sourceManager, ok := app.(interface {
+		GetProxySourcesData() []fetcher.ProxySource
+		AddProxySource(url, protocol string, isAPI bool)
+		RemoveProxySource(index int)
+		TestProxySource(source fetcher.ProxySource) (string, error)
+	})
+	if !ok {
+		app.Log("Error: App does not implement SourceManager interface.")
+		return
+	}
+
+	sourceList := binding.NewStringList()
+	refreshSourceList := func() {
+		currentSources := sourceManager.GetProxySourcesData()
+		var displaySources []string
+		for _, s := range currentSources {
+			displaySources = append(displaySources, fmt.Sprintf("[%s] %s (API: %t)", s.Protocol, s.URL, s.IsAPI))
+		}
+		sourceList.Set(displaySources)
+	}
+	refreshSourceList() // Initial load
+
+	list := widget.NewListWithData(sourceList,
+		func() fyne.CanvasObject {
+			return widget.NewLabel("template")
+		},
+		func(i binding.DataItem, o fyne.CanvasObject) {
+			o.(*widget.Label).Bind(i.(binding.String))
+		})
+
+	var selectedIndex int = -1
+	list.OnSelected = func(id widget.ListItemID) {
+		selectedIndex = id
+	}
+
+	testResult := widget.NewMultiLineEntry()
+	testResult.SetPlaceHolder("测试结果将显示在这里...")
+	testResult.Wrapping = fyne.TextWrapBreak
+
+	addBtn := widget.NewButton("添加", func() {
+		urlEntry := widget.NewEntry()
+		urlEntry.SetPlaceHolder("http://...")
+		protocolSelect := widget.NewSelect([]string{"http", "https", "socks4", "socks5"}, func(s string) {})
+		protocolSelect.SetSelected("http") // Default protocol
+		isAPICheck := widget.NewCheck("是API源", func(b bool) {})
+
+		dialog.ShowForm("添加新代理源", "添加", "取消",
+			[]*widget.FormItem{
+				widget.NewFormItem("URL", urlEntry),
+				widget.NewFormItem("协议", protocolSelect),
+				widget.NewFormItem("类型", isAPICheck),
+			},
+			func(ok bool) {
+				if ok {
+					sourceManager.AddProxySource(urlEntry.Text, protocolSelect.Selected, isAPICheck.Checked)
+					refreshSourceList()
+				}
+			}, win)
+	})
+
+	removeBtn := widget.NewButton("删除", func() {
+		if selectedIndex != -1 {
+			dialog.ShowConfirm("确认删除", "确定要删除选中的代理源吗?", func(ok bool) {
+				if ok {
+					sourceManager.RemoveProxySource(selectedIndex)
+					refreshSourceList()
+					selectedIndex = -1 // Reset selection
+					list.UnselectAll()
+				}
+			}, win)
+		}
+	})
+
+	testBtn := widget.NewButton("测试选中源", func() {
+		if selectedIndex != -1 {
+			currentSources := sourceManager.GetProxySourcesData()
+			if selectedIndex < len(currentSources) {
+				sourceToTest := currentSources[selectedIndex]
+				testResult.SetText(fmt.Sprintf("正在测试源: %s...", sourceToTest.URL))
+				go func() {
+					result, err := sourceManager.TestProxySource(sourceToTest)
+					if err != nil {
+						testResult.SetText(fmt.Sprintf("测试源 %s 失败: %v", sourceToTest.URL, err))
+					} else {
+						testResult.SetText(fmt.Sprintf("测试源 %s 完成:\n%s", sourceToTest.URL, result))
+					}
+				}()
+			}
+		}
+	})
+
+	buttons := container.NewHBox(addBtn, removeBtn, testBtn)
+	leftPanel := container.NewBorder(nil, buttons, nil, nil, list)
+	split := container.NewHSplit(leftPanel, testResult)
+	split.SetOffset(0.5)
+
+	win.SetContent(split)
+	win.Show()
 }
 
 // createServerControlPanel 创建本地代理服务控制面板
@@ -374,12 +457,12 @@ func createProxyList(app Apper) fyne.CanvasObject {
 	}
 
 	table := widget.NewTable(
-		func() (int, int) { return data.Length() + 1, 6 },
+		func() (int, int) { return data.Length() + 1, 7 },
 		func() fyne.CanvasObject { return widget.NewLabel("Template") },
 		func(id widget.TableCellID, cell fyne.CanvasObject) {
 			label := cell.(*widget.Label)
 			if id.Row == 0 {
-				headers := []string{"协议", "代理地址", "延迟(ms)", "速度", "匿名度", "地区"}
+				headers := []string{"协议", "代理地址", "延迟(ms)", "速度", "成功率", "匿名度", "地区"}
 				switch id.Col {
 				case 2: // 延迟列
 					if sortByLatencyDesc {
@@ -426,8 +509,16 @@ func createProxyList(app Apper) fyne.CanvasObject {
 					text = "-"
 				}
 			case 4:
-				text = p.Anonymity
+				total := p.SuccessCount + p.FailCount
+				if total > 0 {
+					rate := float64(p.SuccessCount) / float64(total) * 100
+					text = fmt.Sprintf("%.1f%%", rate)
+				} else {
+					text = "N/A"
+				}
 			case 5:
+				text = p.Anonymity
+			case 6:
 				text = p.Location
 			}
 			label.SetText(text)
@@ -438,8 +529,9 @@ func createProxyList(app Apper) fyne.CanvasObject {
 	table.SetColumnWidth(1, 200) // 代理地址列
 	table.SetColumnWidth(2, 100) // 延迟列
 	table.SetColumnWidth(3, 100) // 速度列
-	table.SetColumnWidth(4, 100) // 匿名度列
-	table.SetColumnWidth(5, 80)  // 地区列
+	table.SetColumnWidth(4, 80)  // 成功率列
+	table.SetColumnWidth(5, 100) // 匿名度列
+	table.SetColumnWidth(6, 80)  // 地区列
 
 	// 点击速度列头排序
 	// 添加右键菜单支持

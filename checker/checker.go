@@ -76,7 +76,7 @@ func (c *Checker) CheckConnectivityAndSpeed(p *proxy.Proxy) (float64, string, er
 	if err != nil {
 		p.FailCount++
 	} else {
-		p.FailCount = 0 // Reset on success
+		p.SuccessCount++
 	}
 	p.LastChecked = time.Now()
 

@@ -41,9 +41,21 @@ type App struct {
 	rotationStop    chan struct{}
 	rotationSeconds int
 
+	// 数据
+	proxySources []fetcher.ProxySource
+	mutex        sync.RWMutex // Add mutex for thread safety
+
 	// 筛选条件
 	maxLatency float64
 	minSpeed   float64
+}
+
+// SourceManager 定义代理源管理接口
+type SourceManager interface {
+	GetProxySourcesData() []fetcher.ProxySource
+	AddProxySource(url, protocol string, isAPI bool)
+	RemoveProxySource(index int)
+	TestProxySource(source fetcher.ProxySource) (string, error)
 }
 
 // NewApp 创建并初始化一个新的 App
@@ -55,6 +67,8 @@ func NewApp() *App {
 
 	a.rotator = proxy.NewRotator()
 	a.checker = checker.NewChecker()
+
+	a.proxySources = fetcher.GetDefaultSources() // 初始化为默认源
 
 	a.proxyList = binding.NewUntypedList()
 	a.progressText = binding.NewString()
@@ -85,7 +99,7 @@ func (a *App) FetchProxies() {
 		a.progressText.Set("获取代理: 正在进行中...")
 		a.Log("开始从所有源获取在线代理...")
 
-		proxies, err := fetcher.FetchAllProxies()
+		proxies, err := fetcher.FetchAllProxies(a.proxySources) // 使用App内部的代理源
 		if err != nil {
 			a.Log(fmt.Sprintf("获取代理时发生错误: %v", err))
 			a.progressText.Set("获取代理: 失败")
@@ -342,6 +356,73 @@ func (a *App) GetProgressText() binding.String   { return a.progressText }
 func (a *App) GetServerStatus() binding.Bool     { return a.serverRunning }
 func (a *App) GetRotationStatus() binding.Bool   { return a.rotationStatus }
 func (a *App) GetCurrentProxy() binding.String   { return a.currentProxy }
+
+// --- SourceManager 接口实现 ---
+func (a *App) GetProxySourcesData() []fetcher.ProxySource {
+	a.mutex.RLock() // Assuming App has a mutex for thread safety
+	defer a.mutex.RUnlock()
+	sourcesCopy := make([]fetcher.ProxySource, len(a.proxySources))
+	copy(sourcesCopy, a.proxySources)
+	return sourcesCopy
+}
+
+func (a *App) AddProxySource(url, protocol string, isAPI bool) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	newSource := fetcher.ProxySource{
+		URL:      url,
+		Protocol: protocol,
+		IsAPI:    isAPI,
+	}
+	a.proxySources = append(a.proxySources, newSource)
+	a.Log(fmt.Sprintf("已添加新的代理源: %s", url))
+}
+
+func (a *App) RemoveProxySource(index int) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	if index < 0 || index >= len(a.proxySources) {
+		return
+	}
+	removed := a.proxySources[index]
+	a.proxySources = append(a.proxySources[:index], a.proxySources[index+1:]...)
+	a.Log(fmt.Sprintf("已移除代理源: %s", removed.URL))
+}
+
+func (a *App) TestProxySource(source fetcher.ProxySource) (string, error) {
+	a.Log(fmt.Sprintf("正在测试代理源: %s", source.URL))
+	proxies, err := fetcher.FetchAllProxies([]fetcher.ProxySource{source})
+	if err != nil {
+		return fmt.Sprintf("测试失败: %v", err), err
+	}
+	if len(proxies) == 0 {
+		return "测试完成: 未获取到任何代理。", nil
+	}
+
+	var validProxies []*proxy.Proxy
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 10) // Limit concurrency for testing individual source
+
+	for _, p := range proxies {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(pr *proxy.Proxy) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			if _, _, err := a.checker.CheckConnectivityAndSpeed(pr); err == nil {
+				validProxies = append(validProxies, pr)
+			}
+		}(p)
+	}
+	wg.Wait()
+
+	if len(validProxies) > 0 {
+		return fmt.Sprintf("测试完成: 从该源获取到 %d 个代理，其中 %d 个有效。", len(proxies), len(validProxies)), nil
+	}
+	return fmt.Sprintf("测试完成: 从该源获取到 %d 个代理，但没有有效代理。", len(proxies)), nil
+}
 
 // ToggleRotation 切换代理轮换状态
 func (a *App) ToggleRotation(enable bool) {

@@ -16,20 +16,21 @@ import (
 // Anonymity: 匿名级别(透明/普通/高匿)
 // Location: 地理位置信息
 type Proxy struct {
-	Address     string
-	Protocol    string
-	Latency     float64
-	Speed       float64
-	Anonymity   string
-	Location    string
-	Country     string
-	Province    string
-	City        string
-	Score       float64 // 0-100 score based on performance metrics
-	LastChecked time.Time
-	Region      string
-	IsPremium   bool
-	FailCount   int
+	Address      string
+	Protocol     string
+	Latency      float64
+	Speed        float64
+	Anonymity    string
+	Location     string
+	Country      string
+	Province     string
+	City         string
+	Score        float64 // 0-100 score based on performance metrics
+	LastChecked  time.Time
+	Region       string
+	IsPremium    bool
+	FailCount    int
+	SuccessCount int
 }
 
 // Rotator 代理池管理器
