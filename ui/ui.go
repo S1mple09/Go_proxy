@@ -3,14 +3,11 @@ package ui
 import (
 	"fmt"
 	"go_proxy/proxy"
-	"image/color"
+	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/dialog"
@@ -42,8 +39,7 @@ func (m *minSizeLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
 type Apper interface {
 	GetWindow() fyne.Window
 	GetProxyList() binding.UntypedList
-	GetLogBinding() binding.String
-	GetProgressBar() *widget.ProgressBar
+	GetProgressText() binding.String
 	GetServerStatus() binding.Bool
 	GetRotationStatus() binding.Bool
 	GetCurrentProxy() binding.String
@@ -66,33 +62,19 @@ func SetupUI(app Apper) {
 	filterControl := createFilterControlPanel(app)
 	serverControl := createServerControlPanel(app)
 	rotationControl := createRotationControlPanel(app)
-	// Create progress bar
-	progressBar := app.GetProgressBar()
-	progressCard := widget.NewCard("进度", "", progressBar)
+	// Create progress text
+	progressLabel := widget.NewLabel("")
+	progressLabel.Bind(app.GetProgressText())
+	progressCard := widget.NewCard("进度", "", progressLabel)
 
 	proxyList := createProxyList(app)
-	logView := createLogView(app)
-
-	// 新的两栏布局：代理列表 | 日志
-	leftPanel := container.New(
-		&minSizeLayout{minSize: fyne.NewSize(200, 0)},
-		container.NewVScroll(proxyList),
-	)
-
-	rightPanel := container.New(
-		&minSizeLayout{minSize: fyne.NewSize(300, 0)},
-		container.NewVScroll(logView),
-	)
-
-	mainSplit := container.NewHSplit(leftPanel, rightPanel)
-	mainSplit.SetOffset(0.7) // 默认左侧占70%
 
 	topPanel := container.NewVBox(toolbar, filterControl, serverControl, rotationControl, progressCard)
-	mainLayout := container.NewBorder(topPanel, nil, nil, nil, mainSplit)
+	mainLayout := container.NewBorder(topPanel, nil, nil, nil, proxyList)
 
 	win := app.GetWindow()
 	win.SetContent(container.NewPadded(mainLayout))
-	win.Resize(fyne.NewSize(1280, 800))
+	win.Resize(fyne.NewSize(800, 600))
 }
 
 // createToolbar 创建顶部工具栏，包含代理操作的主要功能按钮
@@ -103,56 +85,19 @@ func createToolbar(app Apper) fyne.CanvasObject {
 
 	// 主题切换选择框
 	themeSelect := widget.NewSelect([]string{"默认", "深色", "自定义", "蓝色", "绿色"}, func(selected string) {
-		win := app.GetWindow()
-		go func() {
-			// 创建一个半透明的黑色矩形作为过渡层
-			overlay := canvas.NewRectangle(color.NRGBA{R: 0, G: 0, B: 0, A: 0})
-			win.Canvas().Overlays().Add(overlay)
-
-			var wg sync.WaitGroup
-			wg.Add(1)
-
-			// 渐入动画
-			animationIn := fyne.NewAnimation(time.Millisecond*200, func(v float32) {
-				overlay.FillColor = color.NRGBA{R: 0, G: 0, B: 0, A: uint8(255 * v)}
-				canvas.Refresh(overlay)
-				if v == 1.0 {
-					wg.Done()
-				}
-			})
-			animationIn.Curve = fyne.AnimationEaseOut
-			animationIn.Start()
-			wg.Wait()
-
-			// 切换主题
-			switch selected {
-			case "默认":
-				fyne.CurrentApp().Settings().SetTheme(fynetheme.LightTheme())
-			case "深色":
-				fyne.CurrentApp().Settings().SetTheme(fynetheme.DarkTheme())
-			case "自定义":
-				fyne.CurrentApp().Settings().SetTheme(&customtheme.MyTheme{})
-			case "蓝色":
-				fyne.CurrentApp().Settings().SetTheme(&customtheme.BlueTheme{})
-			case "绿色":
-				fyne.CurrentApp().Settings().SetTheme(&customtheme.GreenTheme{})
-			}
-
-			wg.Add(1)
-			// 渐出动画
-			animationOut := fyne.NewAnimation(time.Millisecond*200, func(v float32) {
-				overlay.FillColor = color.NRGBA{R: 0, G: 0, B: 0, A: uint8(255 * (1 - v))}
-				canvas.Refresh(overlay)
-				if v == 1.0 {
-					wg.Done()
-				}
-			})
-			animationOut.Curve = fyne.AnimationEaseIn
-			animationOut.Start()
-			wg.Wait()
-
-			win.Canvas().Overlays().Remove(overlay)
-		}()
+		// 切换主题
+		switch selected {
+		case "默认":
+			fyne.CurrentApp().Settings().SetTheme(fynetheme.LightTheme())
+		case "深色":
+			fyne.CurrentApp().Settings().SetTheme(fynetheme.DarkTheme())
+		case "自定义":
+			fyne.CurrentApp().Settings().SetTheme(&customtheme.MyTheme{})
+		case "蓝色":
+			fyne.CurrentApp().Settings().SetTheme(&customtheme.BlueTheme{})
+		case "绿色":
+			fyne.CurrentApp().Settings().SetTheme(&customtheme.GreenTheme{})
+		}
 	})
 	themeSelect.SetSelected("自定义") // 默认选中自定义主题
 
@@ -316,7 +261,26 @@ func queryIPCountry(ip string) (string, error) {
 // createProxyList 创建代理列表表格视图
 // 以表格形式展示所有可用代理，包含协议、地址、延迟、速度等关键信息
 func createProxyList(app Apper) fyne.CanvasObject {
-	data := app.GetProxyList()
+	originalData := app.GetProxyList()
+	filteredData := binding.NewUntypedList()
+
+	// 过滤并设置数据显示
+	filterAndSet := func() {
+		items, _ := originalData.Get()
+		filteredItems := make([]interface{}, 0)
+		for _, item := range items {
+			if p, ok := item.(*proxy.Proxy); ok && p.Speed > 0 {
+				filteredItems = append(filteredItems, p)
+			}
+		}
+		filteredData.Set(filteredItems)
+	}
+
+	// 首次加载和数据变更时应用过滤
+	filterAndSet()
+	originalData.AddListener(binding.NewDataListener(filterAndSet))
+
+	data := filteredData // 后续代码使用过滤后的数据
 	var (
 		sortBySpeedDesc   bool = true
 		sortByLatencyDesc bool = true
@@ -330,49 +294,22 @@ func createProxyList(app Apper) fyne.CanvasObject {
 			proxies[i] = item.(*proxy.Proxy)
 		}
 
-		// 排序代理
-		switch sortBy {
-		case "speed":
-			if sortBySpeedDesc {
-				// 降序排序
-				for i := 0; i < len(proxies)-1; i++ {
-					for j := i + 1; j < len(proxies); j++ {
-						if proxies[i].Speed < proxies[j].Speed {
-							proxies[i], proxies[j] = proxies[j], proxies[i]
-						}
-					}
+		// 使用 sort.Slice 进行高效排序
+		sort.Slice(proxies, func(i, j int) bool {
+			switch sortBy {
+			case "speed":
+				if sortBySpeedDesc {
+					return proxies[i].Speed > proxies[j].Speed // 降序
 				}
-			} else {
-				// 升序排序
-				for i := 0; i < len(proxies)-1; i++ {
-					for j := i + 1; j < len(proxies); j++ {
-						if proxies[i].Speed > proxies[j].Speed {
-							proxies[i], proxies[j] = proxies[j], proxies[i]
-						}
-					}
+				return proxies[i].Speed < proxies[j].Speed // 升序
+			case "latency":
+				if sortByLatencyDesc {
+					return proxies[i].Latency > proxies[j].Latency // 降序
 				}
+				return proxies[i].Latency < proxies[j].Latency // 升序
 			}
-		case "latency":
-			if sortByLatencyDesc {
-				// 降序排序
-				for i := 0; i < len(proxies)-1; i++ {
-					for j := i + 1; j < len(proxies); j++ {
-						if proxies[i].Latency < proxies[j].Latency {
-							proxies[i], proxies[j] = proxies[j], proxies[i]
-						}
-					}
-				}
-			} else {
-				// 升序排序
-				for i := 0; i < len(proxies)-1; i++ {
-					for j := i + 1; j < len(proxies); j++ {
-						if proxies[i].Latency > proxies[j].Latency {
-							proxies[i], proxies[j] = proxies[j], proxies[i]
-						}
-					}
-				}
-			}
-		}
+			return false
+		})
 
 		newItems := make([]interface{}, len(proxies))
 		for i, p := range proxies {
@@ -419,10 +356,15 @@ func createProxyList(app Apper) fyne.CanvasObject {
 					p := items[selectedRow.Row-1].(*proxy.Proxy)
 					dialog.ShowConfirm("确认删除", fmt.Sprintf("确定要删除代理 %s 吗?", p.Address), func(ok bool) {
 						if ok {
-							newItems := make([]interface{}, 0, len(items)-1)
-							newItems = append(newItems, items[:selectedRow.Row-1]...)
-							newItems = append(newItems, items[selectedRow.Row:]...)
-							data.Set(newItems)
+							// 从原始数据中删除
+							originalItems, _ := originalData.Get()
+							newOriginalItems := make([]interface{}, 0)
+							for _, item := range originalItems {
+								if item.(*proxy.Proxy).Address != p.Address {
+									newOriginalItems = append(newOriginalItems, item)
+								}
+							}
+							originalData.Set(newOriginalItems) // 这将触发监听器并更新过滤列表
 							app.Log(fmt.Sprintf("已删除代理: %s", p.Address))
 						}
 					}, app.GetWindow())
@@ -431,16 +373,13 @@ func createProxyList(app Apper) fyne.CanvasObject {
 		}),
 	}
 
-	// Create animated container for table
-	tableContainer := container.NewStack()
-	overlay := container.NewWithoutLayout()
 	table := widget.NewTable(
 		func() (int, int) { return data.Length() + 1, 6 },
 		func() fyne.CanvasObject { return widget.NewLabel("Template") },
 		func(id widget.TableCellID, cell fyne.CanvasObject) {
 			label := cell.(*widget.Label)
 			if id.Row == 0 {
-				headers := []string{"协议", "代理地址", "延迟(ms)", "速度(KB/s)", "匿名度", "地区"}
+				headers := []string{"协议", "代理地址", "延迟(ms)", "速度", "匿名度", "地区"}
 				switch id.Col {
 				case 2: // 延迟列
 					if sortByLatencyDesc {
@@ -450,9 +389,9 @@ func createProxyList(app Apper) fyne.CanvasObject {
 					}
 				case 3: // 速度列
 					if sortBySpeedDesc {
-						headers[3] = "速度(KB/s) ▼"
+						headers[3] = "速度 ▼"
 					} else {
-						headers[3] = "速度(KB/s) ▲"
+						headers[3] = "速度 ▲"
 					}
 				}
 				label.SetText(headers[id.Col])
@@ -472,15 +411,19 @@ func createProxyList(app Apper) fyne.CanvasObject {
 				text = p.Address
 			case 2:
 				if p.Latency > 0 {
-					text = fmt.Sprintf("%6.0f", p.Latency*1000) // 右对齐数字
+					text = fmt.Sprintf("%d", int(p.Latency*1000))
 				} else {
-					text = fmt.Sprintf("%6s", "-") // 保持相同宽度
+					text = "-"
 				}
 			case 3:
 				if p.Speed > 0 {
-					text = fmt.Sprintf("%6.2f", p.Speed) // 右对齐数字
+					if p.Speed > 1024 { // 如果速度大于1024KB/s，则以MB/s为单位
+						text = fmt.Sprintf("%.2f MB/s", p.Speed/1024)
+					} else {
+						text = fmt.Sprintf("%.2f KB/s", p.Speed)
+					}
 				} else {
-					text = fmt.Sprintf("%6s", "-") // 保持相同宽度
+					text = "-"
 				}
 			case 4:
 				text = p.Anonymity
@@ -522,41 +465,11 @@ func createProxyList(app Apper) fyne.CanvasObject {
 		}
 	}
 
-	// Add fade animation when proxy list updates
 	data.AddListener(binding.NewDataListener(func() {
-		go func() {
-			// Fade out by adding semi-transparent overlay
-			for i := 0.0; i <= 1.0; i += 0.1 {
-				fyne.Do(func() {
-					overlay.Objects[0].(*canvas.Rectangle).FillColor = color.NRGBA{R: 255, G: 255, B: 255, A: uint8(150 * i)}
-					overlay.Refresh()
-				})
-				time.Sleep(10 * time.Millisecond)
-			}
-
-			// Refresh table
-			fyne.Do(func() {
-				table.Refresh()
-			})
-
-			// Fade in by removing overlay
-			for i := 1.0; i >= 0; i -= 0.1 {
-				fyne.Do(func() {
-					overlay.Objects[0].(*canvas.Rectangle).FillColor = color.NRGBA{R: 255, G: 255, B: 255, A: uint8(150 * i)}
-					overlay.Refresh()
-				})
-				time.Sleep(10 * time.Millisecond)
-			}
-		}()
+		table.Refresh()
 	}))
 
-	// Add white semi-transparent rectangle for fade effect
-	rect := canvas.NewRectangle(color.NRGBA{R: 255, G: 255, B: 255, A: 0})
-	rect.Resize(table.MinSize())
-	overlay.Add(rect)
-	tableContainer.Add(table)
-	tableContainer.Add(overlay)
-	return widget.NewCard("有效代理列表", "", tableContainer)
+	return widget.NewCard("有效代理列表", "", table)
 }
 
 // createRotationControlPanel 创建代理轮换控制面板
@@ -602,18 +515,4 @@ func createRotationControlPanel(app Apper) fyne.CanvasObject {
 	return widget.NewAccordion(
 		widget.NewAccordionItem("代理轮换", grid),
 	)
-}
-
-// createLogView 创建应用日志显示区域
-// 实时显示应用操作日志和代理测试结果，支持自动滚动更新
-func createLogView(app Apper) fyne.CanvasObject {
-	logBinding := app.GetLogBinding()
-	logEntry := widget.NewMultiLineEntry()
-	logEntry.Bind(logBinding)
-	logEntry.Disable()
-	scroll := container.NewScroll(logEntry)
-	logBinding.AddListener(binding.NewDataListener(func() {
-		scroll.ScrollToBottom()
-	}))
-	return widget.NewCard("实时日志", "", scroll)
 }

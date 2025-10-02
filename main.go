@@ -20,7 +20,6 @@ import (
 	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/storage"
-	"fyne.io/fyne/v2/widget"
 )
 
 // App 用于统一管理应用的状态和组件
@@ -34,8 +33,7 @@ type App struct {
 
 	// UI 组件的数据绑定
 	proxyList       binding.UntypedList
-	logBinding      binding.String
-	progressBar     *widget.ProgressBar
+	progressText    binding.String
 	serverRunning   binding.Bool
 	rotationStatus  binding.Bool
 	currentProxy    binding.String
@@ -59,8 +57,7 @@ func NewApp() *App {
 	a.checker = checker.NewChecker()
 
 	a.proxyList = binding.NewUntypedList()
-	a.logBinding = binding.NewString()
-	a.progressBar = widget.NewProgressBar()
+	a.progressText = binding.NewString()
 	a.serverRunning = binding.NewBool()
 	a.serverRunning.Set(false)
 	a.rotationStatus = binding.NewBool()
@@ -77,41 +74,33 @@ func NewApp() *App {
 	return a
 }
 
-// Log 向UI日志面板添加一条带时间戳的日志
+// Log 向控制台输出一条带时间戳的日志
 func (a *App) Log(message string) {
-	timestamp := time.Now().Format("15:04:05")
-	logStr := fmt.Sprintf("[%s] %s\n", timestamp, message)
-	currentLog, _ := a.logBinding.Get()
-	lines := strings.Split(currentLog, "\n")
-	if len(lines) > 100 {
-		lines = lines[len(lines)-100:]
-	}
-	a.logBinding.Set(strings.Join(lines, "\n") + logStr)
 	log.Println(message)
 }
 
 // FetchProxies 获取代理但不显示，仅存入原始列表
 func (a *App) FetchProxies() {
 	go func() {
+		a.progressText.Set("获取代理: 正在进行中...")
 		a.Log("开始从所有源获取在线代理...")
-		a.progressBar.Show()
-		a.progressBar.SetValue(0)
 
 		proxies, err := fetcher.FetchAllProxies()
 		if err != nil {
 			a.Log(fmt.Sprintf("获取代理时发生错误: %v", err))
+			a.progressText.Set("获取代理: 失败")
+			return
 		}
 		if len(proxies) == 0 {
 			a.Log("未能获取到任何代理。")
-			a.progressBar.Hide()
+			a.progressText.Set("获取代理: 未找到")
 			return
 		}
 
 		a.rotator.SetRawProxies(proxies)
-		a.progressBar.SetValue(1)
-		time.Sleep(1 * time.Second)
-		a.progressBar.Hide()
-		a.Log(fmt.Sprintf("获取完成，发现 %d 个代理地址。请点击“全部测试”来验证它们。", len(proxies)))
+		a.progressText.Set("获取代理: 完成")
+		a.Log(fmt.Sprintf("获取完成，发现 %d 个代理地址。现在开始自动测试...", len(proxies)))
+		a.TestAllProxies()
 	}()
 }
 
@@ -121,15 +110,16 @@ func (a *App) TestAllProxies() {
 		rawProxies, err := a.rotator.GetRawProxies()
 		if err != nil {
 			a.Log(fmt.Sprintf("获取原始代理失败: %v", err))
+			a.progressText.Set("测试代理: 失败")
 			return
 		}
 		if len(rawProxies) == 0 {
 			a.Log("没有可测试的代理，请先获取代理。")
+			a.progressText.Set("测试代理: 无代理")
 			return
 		}
 		a.Log(fmt.Sprintf("开始并发测试 %d 个代理...", len(rawProxies)))
-		a.progressBar.Show()
-		a.progressBar.SetValue(0)
+		a.progressText.Set("测试代理: 正在进行中...")
 		if err := a.rotator.SetValidProxies([]*proxy.Proxy{}); err != nil { // 开始测试前清空有效列表
 			a.Log(fmt.Sprintf("清空有效代理失败: %v", err))
 			return
@@ -160,13 +150,14 @@ func (a *App) TestAllProxies() {
 				}
 				testedMutex.Lock()
 				testedCount++
-				a.progressBar.SetValue(float64(testedCount) / float64(len(rawProxies)))
+				a.progressText.Set(fmt.Sprintf("测试代理: %d/%d", testedCount, len(rawProxies)))
 				testedMutex.Unlock()
 			}(p)
 		}
 		wg.Wait()
 
 		a.Log("基础测试完成。开始后台批量查询地理位置...")
+		a.progressText.Set("测试代理: 查询地理位置...")
 		// 后台批量查询地理位置，不阻塞主流程
 		go func() {
 			validProxies, err := a.rotator.GetValidProxies()
@@ -182,11 +173,9 @@ func (a *App) TestAllProxies() {
 					a.ApplyFiltersAndRefresh() // 再次刷新以显示地理位置
 				}
 			}
+			a.progressText.Set("测试代理: 完成")
 		}()
 
-		a.progressBar.SetValue(1)
-		time.Sleep(1 * time.Second)
-		a.progressBar.Hide()
 		a.Log("全部测试流程完成。")
 	}()
 }
@@ -251,7 +240,8 @@ func (a *App) ImportProxies() {
 		}
 		if len(importedProxies) > 0 {
 			a.rotator.AddRawProxies(importedProxies)
-			a.Log(fmt.Sprintf("成功导入 %d 个代理。请点击“全部测试”来验证它们。", len(importedProxies)))
+			a.Log(fmt.Sprintf("成功导入 %d 个代理。现在开始自动测试...", len(importedProxies)))
+			a.TestAllProxies()
 		}
 	}, a.win)
 	fileDialog.SetFilter(storage.NewExtensionFileFilter([]string{".txt"}))
@@ -329,7 +319,7 @@ func (a *App) ToggleServer(portStr string) {
 
 func main() {
 	myApp := NewApp()
-	myApp.progressBar.Hide()
+	myApp.progressText.Set("就绪")
 
 	go func() {
 		myApp.Log("正在初始化，获取本机公网IP...")
@@ -346,13 +336,12 @@ func main() {
 }
 
 // --- 实现 ui.Apper 接口 ---
-func (a *App) GetWindow() fyne.Window              { return a.win }
-func (a *App) GetProxyList() binding.UntypedList   { return a.proxyList }
-func (a *App) GetLogBinding() binding.String       { return a.logBinding }
-func (a *App) GetProgressBar() *widget.ProgressBar { return a.progressBar }
-func (a *App) GetServerStatus() binding.Bool       { return a.serverRunning }
-func (a *App) GetRotationStatus() binding.Bool     { return a.rotationStatus }
-func (a *App) GetCurrentProxy() binding.String     { return a.currentProxy }
+func (a *App) GetWindow() fyne.Window            { return a.win }
+func (a *App) GetProxyList() binding.UntypedList { return a.proxyList }
+func (a *App) GetProgressText() binding.String   { return a.progressText }
+func (a *App) GetServerStatus() binding.Bool     { return a.serverRunning }
+func (a *App) GetRotationStatus() binding.Bool   { return a.rotationStatus }
+func (a *App) GetCurrentProxy() binding.String   { return a.currentProxy }
 
 // ToggleRotation 切换代理轮换状态
 func (a *App) ToggleRotation(enable bool) {
@@ -399,11 +388,21 @@ func (a *App) startRotation() {
 
 // stopRotation 停止代理轮换
 func (a *App) stopRotation() {
+	if running, _ := a.rotationStatus.Get(); !running {
+		return // 如果已经停止，则不执行任何操作
+	}
 	a.rotationStatus.Set(false)
 	if a.rotationTicker != nil {
 		a.rotationTicker.Stop()
 	}
-	close(a.rotationStop)
+	// 检查通道是否已经关闭，避免重复关闭导致的panic
+	select {
+	case <-a.rotationStop:
+		// 通道已关闭，无需操作
+	default:
+		close(a.rotationStop)
+	}
+	// 为下一次启动准备新的通道
 	a.rotationStop = make(chan struct{})
 	a.Log("代理轮换已停止")
 }
