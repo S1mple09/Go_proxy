@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"go_proxy/checker"
+	"go_proxy/config"
 	"go_proxy/fetcher"
 	"go_proxy/proxy"
 	"go_proxy/server"
@@ -20,6 +21,7 @@ import (
 	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/storage"
+	fynetheme "fyne.io/fyne/v2/theme" // Import fynetheme
 )
 
 // App 用于统一管理应用的状态和组件
@@ -44,6 +46,7 @@ type App struct {
 	// 数据
 	proxySources []fetcher.ProxySource
 	mutex        sync.RWMutex // Add mutex for thread safety
+	config       *config.AppConfig
 
 	// 筛选条件
 	maxLatency float64
@@ -63,12 +66,20 @@ func NewApp() *App {
 	a := &App{}
 	a.fyneApp = app.New()
 	a.fyneApp.Settings().SetTheme(&theme.MyTheme{})
-	a.win = a.fyneApp.NewWindow("代理池工具 v0.1.1")
+	a.win = a.fyneApp.NewWindow("代理池工具 v0.2.0")
 
 	a.rotator = proxy.NewRotator()
 	a.checker = checker.NewChecker()
 
-	a.proxySources = fetcher.GetDefaultSources() // 初始化为默认源
+	// Load configuration
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		a.Log(fmt.Sprintf("加载配置失败，使用默认配置: %v", err))
+		cfg = config.NewDefaultConfig()
+	}
+	a.config = cfg
+
+	a.proxySources = cfg.ProxySources // 从配置加载代理源
 
 	a.proxyList = binding.NewUntypedList()
 	a.progressText = binding.NewString()
@@ -78,12 +89,13 @@ func NewApp() *App {
 	a.rotationStatus.Set(false)
 	a.currentProxy = binding.NewString()
 	a.currentProxy.Set("无")
-	a.rotationSeconds = 60
+	a.rotationSeconds = cfg.RotationInterval // 从配置加载轮换间隔
+
 	a.rotationStop = make(chan struct{})
 
-	// 默认不筛选
-	a.maxLatency = -1
-	a.minSpeed = -1
+	// 从配置加载筛选条件
+	a.maxLatency = cfg.MaxLatency
+	a.minSpeed = cfg.MinSpeed
 
 	return a
 }
@@ -196,28 +208,38 @@ func (a *App) TestAllProxies() {
 
 // ApplyFilters 应用筛选条件并刷新UI
 func (a *App) ApplyFilters(maxLatencyStr, minSpeedStr string) {
+	var newMaxLatency float64
 	if maxLatencyStr == "" {
-		a.maxLatency = -1
+		newMaxLatency = -1
 	} else {
 		maxLatency, err := strconv.ParseFloat(maxLatencyStr, 64)
 		if err != nil || maxLatency <= 0 {
-			a.maxLatency = -1
+			newMaxLatency = -1
 		} else {
-			a.maxLatency = maxLatency / 1000 // ms转换为秒
+			newMaxLatency = maxLatency / 1000 // ms转换为秒
 		}
 	}
 
+	var newMinSpeed float64
 	if minSpeedStr == "" {
-		a.minSpeed = -1
+		newMinSpeed = -1
 	} else {
 		minSpeed, err := strconv.ParseFloat(minSpeedStr, 64)
 		if err != nil || minSpeed < 0 {
-			a.minSpeed = -1
+			newMinSpeed = -1
 		} else {
-			a.minSpeed = minSpeed
+			newMinSpeed = minSpeed
 		}
 	}
 
+	a.mutex.Lock()
+	a.maxLatency = newMaxLatency
+	a.minSpeed = newMinSpeed
+	a.config.MaxLatency = newMaxLatency
+	a.config.MinSpeed = newMinSpeed
+	a.mutex.Unlock()
+
+	a.SaveConfig() // Save config after applying filters
 	a.Log("应用筛选条件并刷新列表...")
 	a.ApplyFiltersAndRefresh()
 }
@@ -335,6 +357,22 @@ func main() {
 	myApp := NewApp()
 	myApp.progressText.Set("就绪")
 
+	// Set initial theme from config
+	switch myApp.config.ThemeName {
+	case "默认":
+		myApp.fyneApp.Settings().SetTheme(fynetheme.LightTheme())
+	case "深色":
+		myApp.fyneApp.Settings().SetTheme(fynetheme.DarkTheme())
+	case "自定义":
+		myApp.fyneApp.Settings().SetTheme(&theme.MyTheme{})
+	case "蓝色":
+		myApp.fyneApp.Settings().SetTheme(&theme.BlueTheme{})
+	case "绿色":
+		myApp.fyneApp.Settings().SetTheme(&theme.GreenTheme{})
+	default:
+		myApp.fyneApp.Settings().SetTheme(&theme.MyTheme{})
+	}
+
 	go func() {
 		myApp.Log("正在初始化，获取本机公网IP...")
 		if err := myApp.checker.InitializePublicIP(); err != nil {
@@ -346,6 +384,11 @@ func main() {
 
 	ui.SetupUI(myApp)
 	myApp.win.ShowAndRun()
+
+	// Save config on exit
+	if err := myApp.SaveConfig(); err != nil {
+		myApp.Log(fmt.Sprintf("保存配置失败: %v", err))
+	}
 	log.Println("应用已退出")
 }
 
@@ -356,6 +399,7 @@ func (a *App) GetProgressText() binding.String   { return a.progressText }
 func (a *App) GetServerStatus() binding.Bool     { return a.serverRunning }
 func (a *App) GetRotationStatus() binding.Bool   { return a.rotationStatus }
 func (a *App) GetCurrentProxy() binding.String   { return a.currentProxy }
+func (a *App) GetConfig() *config.AppConfig      { return a.config }
 
 // --- SourceManager 接口实现 ---
 func (a *App) GetProxySourcesData() []fetcher.ProxySource {
@@ -375,6 +419,8 @@ func (a *App) AddProxySource(url, protocol string, isAPI bool) {
 		IsAPI:    isAPI,
 	}
 	a.proxySources = append(a.proxySources, newSource)
+	a.config.ProxySources = a.proxySources // Update config
+	a.SaveConfig()
 	a.Log(fmt.Sprintf("已添加新的代理源: %s", url))
 }
 
@@ -386,6 +432,8 @@ func (a *App) RemoveProxySource(index int) {
 	}
 	removed := a.proxySources[index]
 	a.proxySources = append(a.proxySources[:index], a.proxySources[index+1:]...)
+	a.config.ProxySources = a.proxySources // Update config
+	a.SaveConfig()
 	a.Log(fmt.Sprintf("已移除代理源: %s", removed.URL))
 }
 
@@ -438,12 +486,24 @@ func (a *App) SetRotationInterval(seconds int) {
 	if seconds <= 0 {
 		return
 	}
+	a.mutex.Lock()
 	a.rotationSeconds = seconds
+	a.config.RotationInterval = seconds // Update config
+	a.mutex.Unlock()
+
+	a.SaveConfig()
 	a.Log(fmt.Sprintf("轮换间隔已设置为 %d 秒", seconds))
 	if running, _ := a.rotationStatus.Get(); running {
 		a.stopRotation()
 		a.startRotation()
 	}
+}
+
+// SaveConfig 保存当前配置
+func (a *App) SaveConfig() error {
+	a.mutex.RLock()
+	defer a.mutex.RUnlock()
+	return config.SaveConfig(a.config)
 }
 
 // startRotation 开始代理轮换

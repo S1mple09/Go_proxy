@@ -172,9 +172,9 @@ func (r *Rotator) GetFilteredAndSortedProxies(maxLatency, minSpeed float64) ([]*
 		}
 	}
 
-	// 按延迟升序排序
+	// 按评分降序排序
 	sort.SliceStable(filtered, func(i, j int) bool {
-		return filtered[i].Latency < filtered[j].Latency
+		return filtered[i].Score > filtered[j].Score
 	})
 
 	return filtered, nil

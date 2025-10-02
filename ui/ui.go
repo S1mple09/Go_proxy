@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"go_proxy/config"
 	"go_proxy/fetcher"
 	"go_proxy/proxy"
 	"sort"
@@ -54,6 +55,7 @@ type Apper interface {
 	ToggleRotation(enable bool)
 	SetRotationInterval(seconds int)
 	ApplyFilters(maxLatency, minSpeed string)
+	GetConfig() *config.AppConfig // Add GetConfig method
 }
 
 // SetupUI 初始化应用主界面，排列所有UI组件
@@ -86,6 +88,16 @@ func createToolbar(app Apper) fyne.CanvasObject {
 
 	// 主题切换选择框
 	themeSelect := widget.NewSelect([]string{"默认", "深色", "自定义", "蓝色", "绿色"}, func(selected string) {
+		// Cast app to an interface that has SaveConfig and GetConfig methods
+		configManager, ok := app.(interface {
+			SaveConfig() error
+			GetConfig() *config.AppConfig
+		})
+		if !ok {
+			app.Log("Error: App does not implement config management interface.")
+			return
+		}
+
 		// 切换主题
 		switch selected {
 		case "默认":
@@ -99,8 +111,19 @@ func createToolbar(app Apper) fyne.CanvasObject {
 		case "绿色":
 			fyne.CurrentApp().Settings().SetTheme(&customtheme.GreenTheme{})
 		}
+		// Update config and save
+		cfg := configManager.GetConfig()
+		cfg.ThemeName = selected
+		if err := configManager.SaveConfig(); err != nil {
+			app.Log(fmt.Sprintf("保存主题配置失败: %v", err))
+		}
 	})
-	themeSelect.SetSelected("自定义") // 默认选中自定义主题
+	// Set initial theme from config
+	if cfg := app.GetConfig(); cfg != nil {
+		themeSelect.SetSelected(cfg.ThemeName)
+	} else {
+		themeSelect.SetSelected("自定义") // Fallback to default
+	}
 
 	// 当前轮换IP显示
 	currentRotationIPLabel := widget.NewLabelWithStyle("当前轮换IP: 无", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true})
@@ -367,6 +390,7 @@ func createProxyList(app Apper) fyne.CanvasObject {
 	var (
 		sortBySpeedDesc   bool = true
 		sortByLatencyDesc bool = true
+		sortByScoreDesc   bool = true // New sort state for Score
 	)
 
 	// 排序代理列表
@@ -377,19 +401,23 @@ func createProxyList(app Apper) fyne.CanvasObject {
 			proxies[i] = item.(*proxy.Proxy)
 		}
 
-		// 使用 sort.Slice 进行高效排序
 		sort.Slice(proxies, func(i, j int) bool {
 			switch sortBy {
 			case "speed":
 				if sortBySpeedDesc {
-					return proxies[i].Speed > proxies[j].Speed // 降序
+					return proxies[i].Speed > proxies[j].Speed
 				}
-				return proxies[i].Speed < proxies[j].Speed // 升序
+				return proxies[i].Speed < proxies[j].Speed
 			case "latency":
 				if sortByLatencyDesc {
-					return proxies[i].Latency > proxies[j].Latency // 降序
+					return proxies[i].Latency > proxies[j].Latency
 				}
-				return proxies[i].Latency < proxies[j].Latency // 升序
+				return proxies[i].Latency < proxies[j].Latency
+			case "score": // New sort case for Score
+				if sortByScoreDesc {
+					return proxies[i].Score > proxies[j].Score
+				}
+				return proxies[i].Score < proxies[j].Score
 			}
 			return false
 		})
@@ -401,10 +429,10 @@ func createProxyList(app Apper) fyne.CanvasObject {
 		data.Set(newItems)
 	}
 
-	// 当前选中的行ID
+	// Current selected row ID
 	var selectedRow widget.TableCellID
 
-	// 右键菜单项
+	// Right-click menu items
 	menuItems := []*fyne.MenuItem{
 		fyne.NewMenuItem("测试选中代理", func() {
 			items, _ := data.Get()
@@ -412,7 +440,7 @@ func createProxyList(app Apper) fyne.CanvasObject {
 				p := items[selectedRow.Row-1].(*proxy.Proxy)
 				app.Log(fmt.Sprintf("开始测试代理: %s", p.Address))
 				go func() {
-					// 这里应该调用实际的测试方法
+					// Placeholder for actual test method
 					app.Log(fmt.Sprintf("代理 %s 测试完成", p.Address))
 				}()
 			}
@@ -439,7 +467,6 @@ func createProxyList(app Apper) fyne.CanvasObject {
 					p := items[selectedRow.Row-1].(*proxy.Proxy)
 					dialog.ShowConfirm("确认删除", fmt.Sprintf("确定要删除代理 %s 吗?", p.Address), func(ok bool) {
 						if ok {
-							// 从原始数据中删除
 							originalItems, _ := originalData.Get()
 							newOriginalItems := make([]interface{}, 0)
 							for _, item := range originalItems {
@@ -447,7 +474,7 @@ func createProxyList(app Apper) fyne.CanvasObject {
 									newOriginalItems = append(newOriginalItems, item)
 								}
 							}
-							originalData.Set(newOriginalItems) // 这将触发监听器并更新过滤列表
+							originalData.Set(newOriginalItems)
 							app.Log(fmt.Sprintf("已删除代理: %s", p.Address))
 						}
 					}, app.GetWindow())
@@ -457,24 +484,30 @@ func createProxyList(app Apper) fyne.CanvasObject {
 	}
 
 	table := widget.NewTable(
-		func() (int, int) { return data.Length() + 1, 7 },
+		func() (int, int) { return data.Length() + 1, 8 }, // Increased column count to 8 for Score
 		func() fyne.CanvasObject { return widget.NewLabel("Template") },
 		func(id widget.TableCellID, cell fyne.CanvasObject) {
 			label := cell.(*widget.Label)
 			if id.Row == 0 {
-				headers := []string{"协议", "代理地址", "延迟(ms)", "速度", "成功率", "匿名度", "地区"}
+				headers := []string{"协议", "代理地址", "延迟(ms)", "速度", "成功率", "匿名度", "地区", "评分"}
 				switch id.Col {
-				case 2: // 延迟列
+				case 2: // Latency column
 					if sortByLatencyDesc {
 						headers[2] = "延迟(ms) ▼"
 					} else {
 						headers[2] = "延迟(ms) ▲"
 					}
-				case 3: // 速度列
+				case 3: // Speed column
 					if sortBySpeedDesc {
 						headers[3] = "速度 ▼"
 					} else {
 						headers[3] = "速度 ▲"
+					}
+				case 7: // Score column
+					if sortByScoreDesc {
+						headers[7] = "评分 ▼"
+					} else {
+						headers[7] = "评分 ▲"
 					}
 				}
 				label.SetText(headers[id.Col])
@@ -500,7 +533,7 @@ func createProxyList(app Apper) fyne.CanvasObject {
 				}
 			case 3:
 				if p.Speed > 0 {
-					if p.Speed > 1024 { // 如果速度大于1024KB/s，则以MB/s为单位
+					if p.Speed > 1024 {
 						text = fmt.Sprintf("%.2f MB/s", p.Speed/1024)
 					} else {
 						text = fmt.Sprintf("%.2f KB/s", p.Speed)
@@ -520,38 +553,41 @@ func createProxyList(app Apper) fyne.CanvasObject {
 				text = p.Anonymity
 			case 6:
 				text = p.Location
+			case 7: // Score column
+				text = fmt.Sprintf("%.1f", p.Score)
 			}
 			label.SetText(text)
 			label.TextStyle.Bold = false
 		},
 	)
-	table.SetColumnWidth(0, 70)  // 协议列
-	table.SetColumnWidth(1, 200) // 代理地址列
-	table.SetColumnWidth(2, 100) // 延迟列
-	table.SetColumnWidth(3, 100) // 速度列
-	table.SetColumnWidth(4, 80)  // 成功率列
-	table.SetColumnWidth(5, 100) // 匿名度列
-	table.SetColumnWidth(6, 80)  // 地区列
+	table.SetColumnWidth(0, 70)  // Protocol
+	table.SetColumnWidth(1, 200) // Address
+	table.SetColumnWidth(2, 100) // Latency
+	table.SetColumnWidth(3, 100) // Speed
+	table.SetColumnWidth(4, 80)  // Success Rate
+	table.SetColumnWidth(5, 100) // Anonymity
+	table.SetColumnWidth(6, 80)  // Location
+	table.SetColumnWidth(7, 80)  // Score
 
-	// 点击速度列头排序
-	// 添加右键菜单支持
 	table.OnSelected = func(id widget.TableCellID) {
 		selectedRow = id
 
 		if id.Row > 0 {
-			// 显示右键菜单
 			pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(table)
 			widget.ShowPopUpMenuAtPosition(fyne.NewMenu("", menuItems...), app.GetWindow().Canvas(), pos)
 		}
 
 		if id.Row == 0 {
 			switch id.Col {
-			case 2: // 点击延迟列头
+			case 2: // Click Latency column header
 				sortByLatencyDesc = !sortByLatencyDesc
 				sortProxies("latency")
-			case 3: // 点击速度列头
+			case 3: // Click Speed column header
 				sortBySpeedDesc = !sortBySpeedDesc
 				sortProxies("speed")
+			case 7: // Click Score column header
+				sortByScoreDesc = !sortByScoreDesc
+				sortProxies("score")
 			}
 			table.Refresh()
 		}
