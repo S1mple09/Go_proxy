@@ -6,6 +6,7 @@ import (
 	"image/color"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -69,44 +70,13 @@ func SetupUI(app Apper) {
 	progressBar := app.GetProgressBar()
 	progressCard := widget.NewCard("进度", "", progressBar)
 
-	// 创建代理详情显示区域
-	currentProxyInfo := widget.NewMultiLineEntry()
-	currentProxyInfo.Disable()
-	currentProxyInfo.SetPlaceHolder("当前代理信息将在此显示...")
-
-	// 绑定当前代理信息更新
-	app.GetCurrentProxy().AddListener(binding.NewDataListener(func() {
-		proxyAddr, _ := app.GetCurrentProxy().Get()
-		if proxyAddr != "" {
-			// 获取完整代理信息
-			items, _ := app.GetProxyList().Get()
-			for _, item := range items {
-				p := item.(*proxy.Proxy)
-				if p.Address == proxyAddr {
-					info := fmt.Sprintf("当前代理: %s\n协议: %s\n国家: %s\n省份: %s\n城市: %s\n延迟: %.0fms\n速度: %.2fKB/s\n匿名度: %s",
-						p.Address, p.Protocol, p.Country, p.Province, p.City, p.Latency*1000, p.Speed, p.Anonymity)
-					currentProxyInfo.SetText(info)
-					break
-				}
-			}
-		} else {
-			currentProxyInfo.SetText("")
-		}
-	}))
-
 	proxyList := createProxyList(app)
 	logView := createLogView(app)
 
-	// 新的三栏布局：代理列表 | 代理详情 | 日志
+	// 新的两栏布局：代理列表 | 日志
 	leftPanel := container.New(
 		&minSizeLayout{minSize: fyne.NewSize(200, 0)},
 		container.NewVScroll(proxyList),
-	)
-
-	centerPanel := container.NewBorder(
-		widget.NewLabelWithStyle("当前代理详情", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
-		nil, nil, nil,
-		container.NewScroll(currentProxyInfo),
 	)
 
 	rightPanel := container.New(
@@ -114,13 +84,8 @@ func SetupUI(app Apper) {
 		container.NewVScroll(logView),
 	)
 
-	// 第一层分割：左侧代理列表和中间区域
-	leftSplit := container.NewHSplit(leftPanel, centerPanel)
-	leftSplit.SetOffset(0.3) // 默认左侧占30%
-
-	// 第二层分割：中间区域和右侧日志
-	mainSplit := container.NewHSplit(leftSplit, rightPanel)
-	mainSplit.SetOffset(0.7) // 默认右侧占30%
+	mainSplit := container.NewHSplit(leftPanel, rightPanel)
+	mainSplit.SetOffset(0.7) // 默认左侧占70%
 
 	topPanel := container.NewVBox(toolbar, filterControl, serverControl, rotationControl, progressCard)
 	mainLayout := container.NewBorder(topPanel, nil, nil, nil, mainSplit)
@@ -136,60 +101,78 @@ func createToolbar(app Apper) fyne.CanvasObject {
 	ipEntry := widget.NewEntry()
 	ipEntry.SetPlaceHolder("输入IP地址")
 
-	// 主题切换按钮
-	themeBtn := widget.NewButton("切换主题", func() {
-		currentTheme := fyne.CurrentApp().Settings().Theme()
+	// 主题切换选择框
+	themeSelect := widget.NewSelect([]string{"默认", "深色", "自定义", "蓝色", "绿色"}, func(selected string) {
 		win := app.GetWindow()
-
-		// Create animation overlay
-		overlay := canvas.NewRectangle(color.Transparent)
-		overlay.Resize(win.Content().Size())
-		overlayContainer := container.NewWithoutLayout(overlay)
-		win.Canvas().Overlays().Add(overlayContainer)
-
-		// Fade out overlay
 		go func() {
-			for i := 0.0; i <= 1.0; i += 0.1 {
-				fyne.Do(func() {
-					overlay.FillColor = color.NRGBA{R: 0, G: 0, B: 0, A: uint8(255 * i)}
-					overlayContainer.Refresh()
-				})
-				time.Sleep(20 * time.Millisecond)
-			}
+			// 创建一个半透明的黑色矩形作为过渡层
+			overlay := canvas.NewRectangle(color.NRGBA{R: 0, G: 0, B: 0, A: 0})
+			win.Canvas().Overlays().Add(overlay)
 
-			// Change theme
-			fyne.Do(func() {
-				if _, isCustom := currentTheme.(*customtheme.MyTheme); isCustom {
-					if currentTheme == fynetheme.DarkTheme() {
-						fyne.CurrentApp().Settings().SetTheme(fynetheme.LightTheme())
-					} else {
-						fyne.CurrentApp().Settings().SetTheme(fynetheme.DarkTheme())
-					}
-				} else {
-					fyne.CurrentApp().Settings().SetTheme(&customtheme.MyTheme{})
+			var wg sync.WaitGroup
+			wg.Add(1)
+
+			// 渐入动画
+			animationIn := fyne.NewAnimation(time.Millisecond*200, func(v float32) {
+				overlay.FillColor = color.NRGBA{R: 0, G: 0, B: 0, A: uint8(255 * v)}
+				canvas.Refresh(overlay)
+				if v == 1.0 {
+					wg.Done()
 				}
 			})
+			animationIn.Curve = fyne.AnimationEaseOut
+			animationIn.Start()
+			wg.Wait()
 
-			// Fade in overlay
-			for i := 1.0; i >= 0; i -= 0.1 {
-				fyne.Do(func() {
-					overlay.FillColor = color.NRGBA{R: 0, G: 0, B: 0, A: uint8(255 * i)}
-					overlayContainer.Refresh()
-				})
-				time.Sleep(20 * time.Millisecond)
+			// 切换主题
+			switch selected {
+			case "默认":
+				fyne.CurrentApp().Settings().SetTheme(fynetheme.LightTheme())
+			case "深色":
+				fyne.CurrentApp().Settings().SetTheme(fynetheme.DarkTheme())
+			case "自定义":
+				fyne.CurrentApp().Settings().SetTheme(&customtheme.MyTheme{})
+			case "蓝色":
+				fyne.CurrentApp().Settings().SetTheme(&customtheme.BlueTheme{})
+			case "绿色":
+				fyne.CurrentApp().Settings().SetTheme(&customtheme.GreenTheme{})
 			}
-			fyne.Do(func() {
-				win.Canvas().Overlays().Remove(overlayContainer)
+
+			wg.Add(1)
+			// 渐出动画
+			animationOut := fyne.NewAnimation(time.Millisecond*200, func(v float32) {
+				overlay.FillColor = color.NRGBA{R: 0, G: 0, B: 0, A: uint8(255 * (1 - v))}
+				canvas.Refresh(overlay)
+				if v == 1.0 {
+					wg.Done()
+				}
 			})
+			animationOut.Curve = fyne.AnimationEaseIn
+			animationOut.Start()
+			wg.Wait()
+
+			win.Canvas().Overlays().Remove(overlay)
 		}()
 	})
+	themeSelect.SetSelected("自定义") // 默认选中自定义主题
+
+	// 当前轮换IP显示
+	currentRotationIPLabel := widget.NewLabelWithStyle("当前轮换IP: 无", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true})
+	app.GetCurrentProxy().AddListener(binding.NewDataListener(func() {
+		proxyAddr, _ := app.GetCurrentProxy().Get()
+		if proxyAddr != "" {
+			currentRotationIPLabel.SetText(fmt.Sprintf("当前轮换IP: %s", proxyAddr))
+		} else {
+			currentRotationIPLabel.SetText("当前轮换IP: 无")
+		}
+	}))
 
 	buttons := container.NewHBox(
 		widget.NewButton("获取代理", app.FetchProxies),
 		widget.NewButton("测试代理", app.TestAllProxies),
 		widget.NewButton("导入代理", app.ImportProxies),
 		widget.NewButton("导出代理", app.ExportProxies),
-		themeBtn,
+		themeSelect, // 使用主题选择框
 		widget.NewButton("查询IP", func() {
 			ip := ipEntry.Text
 			if ip != "" {
@@ -223,7 +206,8 @@ func createToolbar(app Apper) fyne.CanvasObject {
 				}
 			}, app.GetWindow())
 		}),
-		ipEntry,
+		layout.NewSpacer(), // 将IP显示推到右侧
+		currentRotationIPLabel,
 	)
 	return container.NewPadded(buttons)
 }
@@ -254,7 +238,7 @@ func createFilterControlPanel(app Apper) fyne.CanvasObject {
 
 // createServerControlPanel 创建本地代理服务控制面板
 // 允许配置端口并启动/停止SOCKS5代理服务，显示当前服务状态
-func createServerControlPanel(app Apper) *widget.Card {
+func createServerControlPanel(app Apper) fyne.CanvasObject {
 	portEntry := widget.NewEntry()
 	portEntry.SetPlaceHolder("例如: 10808")
 	portEntry.SetText("10808")
@@ -289,7 +273,9 @@ func createServerControlPanel(app Apper) *widget.Card {
 		widget.NewLabel("当前状态:"), statusLabel,
 		layout.NewSpacer(), toggleServerBtn,
 	)
-	return widget.NewCard("服务控制", "启动本地代理服务以使用轮换IP", grid)
+	return widget.NewAccordion(
+		widget.NewAccordionItem("服务控制", grid),
+	)
 }
 
 // queryIPCountry 本地查询IP地理位置信息
@@ -575,7 +561,7 @@ func createProxyList(app Apper) fyne.CanvasObject {
 
 // createRotationControlPanel 创建代理轮换控制面板
 // 提供轮换开关、当前代理显示和轮换间隔设置功能
-func createRotationControlPanel(app Apper) *widget.Card {
+func createRotationControlPanel(app Apper) fyne.CanvasObject {
 	rotationStatus := app.GetRotationStatus()
 	currentProxy := app.GetCurrentProxy()
 
@@ -613,7 +599,9 @@ func createRotationControlPanel(app Apper) *widget.Card {
 		widget.NewLabel("轮换间隔(秒):"), intervalEntry,
 		layout.NewSpacer(), intervalBtn,
 	)
-	return widget.NewCard("代理轮换", "控制代理自动轮换行为", grid)
+	return widget.NewAccordion(
+		widget.NewAccordionItem("代理轮换", grid),
+	)
 }
 
 // createLogView 创建应用日志显示区域
