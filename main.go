@@ -11,6 +11,7 @@ import (
 	"go_proxy/theme"
 	"go_proxy/ui"
 	"log"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +34,9 @@ type App struct {
 	checker *checker.Checker
 	server  *server.Server
 
+	// 代理源管理器（实现SourceManager接口）
+	sourceManager *fetcher.SourceManager
+
 	// UI 组件的数据绑定
 	proxyList       binding.UntypedList
 	progressText    binding.String
@@ -49,16 +53,25 @@ type App struct {
 	config       *config.AppConfig
 
 	// 筛选条件
-	maxLatency float64
-	minSpeed   float64
+	maxLatency       float64
+	minSpeed         float64
+	rotationInterval int
+	themeName        string
+
+	// 服务器配置
+	allowedCountries    []string
+	proxyMode           string
+	healthCheckInterval int
 }
+
+//}
 
 // SourceManager 定义代理源管理接口
 type SourceManager interface {
-	GetProxySourcesData() []fetcher.ProxySource
-	AddProxySource(url, protocol string, isAPI bool)
-	RemoveProxySource(index int)
-	TestProxySource(source fetcher.ProxySource) (string, error)
+	GetSources() []fetcher.ProxySource
+	AddSource(source fetcher.ProxySource)
+	RemoveSource(index int)
+	TestSource(source fetcher.ProxySource) (string, error)
 }
 
 // NewApp 创建并初始化一个新的 App
@@ -66,31 +79,48 @@ func NewApp() *App {
 	a := &App{}
 	a.fyneApp = app.New()
 	a.fyneApp.Settings().SetTheme(&theme.MyTheme{})
-	a.win = a.fyneApp.NewWindow("代理池工具 v0.2.0")
+	a.win = a.fyneApp.NewWindow("代理池工具 v0.3.0")
 
 	a.rotator = proxy.NewRotator()
-	a.checker = checker.NewChecker()
+	a.checker = checker.NewChecker(checker.Config{
+		Timeout:            10 * time.Second,
+		FailThreshold:      3,
+		AutoRetestInterval: 60 * time.Second,
+		ExitOnFailedTCP:    true,
+	})
+
+	// 初始化代理源管理器
+	a.sourceManager = fetcher.NewSourceManager()
 
 	// Load configuration
 	cfg, err := config.LoadConfig()
 	if err != nil {
-		a.Log(fmt.Sprintf("加载配置失败，使用默认配置: %v", err))
+		log.Printf("Failed to load configuration, using default: %v", err)
 		cfg = config.NewDefaultConfig()
 	}
+
 	a.config = cfg
+	// 从配置加载所有字段
+	a.proxySources = cfg.ProxySources
+	a.maxLatency = cfg.MaxLatency
+	a.minSpeed = cfg.MinSpeed
+	a.rotationInterval = cfg.RotationInterval
+	a.rotationSeconds = cfg.RotationInterval
+	a.themeName = cfg.ThemeName
+	a.proxyMode = cfg.ProxyMode
+	a.healthCheckInterval = cfg.HealthCheckInterval
+	a.allowedCountries = cfg.AllowedCountries
 
-	a.proxySources = cfg.ProxySources // 从配置加载代理源
+	// 设置代理源到sourceManager
+	a.sourceManager.SetSources(cfg.ProxySources)
 
+	// 初始化数据绑定
 	a.proxyList = binding.NewUntypedList()
 	a.progressText = binding.NewString()
 	a.serverRunning = binding.NewBool()
-	a.serverRunning.Set(false)
 	a.rotationStatus = binding.NewBool()
-	a.rotationStatus.Set(false)
 	a.currentProxy = binding.NewString()
 	a.currentProxy.Set("无")
-	a.rotationSeconds = cfg.RotationInterval // 从配置加载轮换间隔
-
 	a.rotationStop = make(chan struct{})
 
 	// 从配置加载筛选条件
@@ -152,13 +182,49 @@ func (a *App) TestAllProxies() {
 		}
 		a.ApplyFiltersAndRefresh()
 
-		var wg sync.WaitGroup
-		var testedCount int
-		var testedMutex sync.Mutex
+		// 优化1: 根据CPU核心数动态设置并发数
+		concurrencyLimit := runtime.NumCPU() * 25
+		if concurrencyLimit > 300 {
+			concurrencyLimit = 300
+		} else if concurrencyLimit < 50 {
+			concurrencyLimit = 50
+		}
 
-		concurrencyLimit := 200
 		sem := make(chan struct{}, concurrencyLimit)
+		var wg sync.WaitGroup
+		testedCount := 0
+		testedMutex := sync.Mutex{}
 
+		// 优化2: 使用通道批量处理有效代理，减少锁竞争
+		validProxiesChan := make(chan *proxy.Proxy, concurrencyLimit)
+		batchSize := 50
+		var batchProxies []*proxy.Proxy
+
+		// 启动结果处理协程
+		go func() {
+			for p := range validProxiesChan {
+				testedMutex.Lock()
+				batchProxies = append(batchProxies, p)
+
+				// 达到批次大小时批量添加并刷新UI
+				if len(batchProxies) >= batchSize {
+					a.rotator.AddValidProxies(batchProxies)
+					a.ApplyFiltersAndRefresh()
+					batchProxies = batchProxies[:0] // 清空切片，重用空间
+				}
+				testedMutex.Unlock()
+			}
+
+			// 处理剩余的代理
+			testedMutex.Lock()
+			if len(batchProxies) > 0 {
+				a.rotator.AddValidProxies(batchProxies)
+				a.ApplyFiltersAndRefresh()
+			}
+			testedMutex.Unlock()
+		}()
+
+		// 并发测试代理
 		for _, p := range rawProxies {
 			wg.Add(1)
 			sem <- struct{}{}
@@ -166,21 +232,25 @@ func (a *App) TestAllProxies() {
 				defer func() {
 					<-sem
 					wg.Done()
-				}()
-				if _, _, err := a.checker.CheckConnectivityAndSpeed(pr); err == nil {
-					// 测试成功，立即添加到有效列表并刷新UI
-					if err := a.rotator.AddValidProxies([]*proxy.Proxy{pr}); err != nil {
-						a.Log(fmt.Sprintf("添加有效代理失败: %v", err))
+					testedMutex.Lock()
+					testedCount++
+					// 优化3: 降低UI进度更新频率
+					if testedCount%20 == 0 || testedCount == len(rawProxies) {
+						a.progressText.Set(fmt.Sprintf("测试代理: %d/%d", testedCount, len(rawProxies)))
 					}
-					a.ApplyFiltersAndRefresh()
+					testedMutex.Unlock()
+				}()
+
+				// 测试代理连接性和速度
+				if _, _, err := a.checker.CheckConnectivityAndSpeed(pr); err == nil {
+					// 将有效代理发送到通道
+					validProxiesChan <- pr
 				}
-				testedMutex.Lock()
-				testedCount++
-				a.progressText.Set(fmt.Sprintf("测试代理: %d/%d", testedCount, len(rawProxies)))
-				testedMutex.Unlock()
 			}(p)
 		}
+
 		wg.Wait()
+		close(validProxiesChan) // 关闭通道，通知结果处理协程结束
 
 		a.Log("基础测试完成。开始后台批量查询地理位置...")
 		a.progressText.Set("测试代理: 查询地理位置...")
@@ -345,12 +415,31 @@ func (a *App) ToggleServer(portStr string) {
 		return
 	}
 
+	listenAddr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	// 使用新的ProxyServer构造函数，设置代理模式和超时
+	proxyMode := server.FixedMode
+	if a.config.ProxyMode == "per_request" {
+		proxyMode = server.PerRequestMode
+	}
+
 	a.server = server.NewServer("127.0.0.1", port, a.rotator)
+
+	// 启动服务
 	if err := a.server.Start(); err != nil {
 		a.Log(fmt.Sprintf("启动服务失败: %v", err))
 		return
 	}
+
+	// 设置健康检查
+	checkInterval := 5 * time.Minute
+	if a.config.HealthCheckInterval > 0 {
+		checkInterval = time.Duration(a.config.HealthCheckInterval) * time.Minute
+	}
+	a.server.StartHealthChecks(checkInterval)
+
 	a.serverRunning.Set(true)
+	a.Log(fmt.Sprintf("代理服务已在 %s 启动，模式: %s", listenAddr, proxyMode))
 }
 
 func main() {
@@ -402,74 +491,41 @@ func (a *App) GetCurrentProxy() binding.String   { return a.currentProxy }
 func (a *App) GetConfig() *config.AppConfig      { return a.config }
 
 // --- SourceManager 接口实现 ---
-func (a *App) GetProxySourcesData() []fetcher.ProxySource {
-	a.mutex.RLock() // Assuming App has a mutex for thread safety
-	defer a.mutex.RUnlock()
-	sourcesCopy := make([]fetcher.ProxySource, len(a.proxySources))
-	copy(sourcesCopy, a.proxySources)
-	return sourcesCopy
+// --- SourceManager 接口实现 ---
+func (a *App) GetSources() []fetcher.ProxySource {
+	return a.sourceManager.GetSources()
 }
 
-func (a *App) AddProxySource(url, protocol string, isAPI bool) {
-	a.mutex.Lock()
-	defer a.mutex.Unlock()
-	newSource := fetcher.ProxySource{
-		URL:      url,
-		Protocol: protocol,
-		IsAPI:    isAPI,
-	}
-	a.proxySources = append(a.proxySources, newSource)
-	a.config.ProxySources = a.proxySources // Update config
+func (a *App) AddSource(source fetcher.ProxySource) {
+	a.sourceManager.AddSource(source)
+	// 更新配置和保存
+	a.config.ProxySources = a.sourceManager.GetSources()
 	a.SaveConfig()
-	a.Log(fmt.Sprintf("已添加新的代理源: %s", url))
+	a.Log(fmt.Sprintf("已添加新的代理源: %s", source.URL))
 }
 
-func (a *App) RemoveProxySource(index int) {
-	a.mutex.Lock()
-	defer a.mutex.Unlock()
-	if index < 0 || index >= len(a.proxySources) {
+func (a *App) RemoveSource(index int) {
+	// 转换索引以找到正确的自定义源位置
+	defaultSources := a.sourceManager.GetDefaultSources()
+	if index < len(defaultSources) {
+		// 不能删除默认源
+		a.Log("无法删除默认代理源")
 		return
 	}
-	removed := a.proxySources[index]
-	a.proxySources = append(a.proxySources[:index], a.proxySources[index+1:]...)
-	a.config.ProxySources = a.proxySources // Update config
-	a.SaveConfig()
-	a.Log(fmt.Sprintf("已移除代理源: %s", removed.URL))
+
+	// 调整为自定义源的索引
+	customIndex := index - len(defaultSources)
+	if a.sourceManager.RemoveSource(customIndex) {
+		// 更新配置和保存
+		a.config.ProxySources = a.sourceManager.GetSources()
+		a.SaveConfig()
+		a.Log("已移除代理源")
+	}
 }
 
-func (a *App) TestProxySource(source fetcher.ProxySource) (string, error) {
+func (a *App) TestSource(source fetcher.ProxySource) (string, error) {
 	a.Log(fmt.Sprintf("正在测试代理源: %s", source.URL))
-	proxies, err := fetcher.FetchAllProxies([]fetcher.ProxySource{source})
-	if err != nil {
-		return fmt.Sprintf("测试失败: %v", err), err
-	}
-	if len(proxies) == 0 {
-		return "测试完成: 未获取到任何代理。", nil
-	}
-
-	var validProxies []*proxy.Proxy
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 10) // Limit concurrency for testing individual source
-
-	for _, p := range proxies {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(pr *proxy.Proxy) {
-			defer func() {
-				<-sem
-				wg.Done()
-			}()
-			if _, _, err := a.checker.CheckConnectivityAndSpeed(pr); err == nil {
-				validProxies = append(validProxies, pr)
-			}
-		}(p)
-	}
-	wg.Wait()
-
-	if len(validProxies) > 0 {
-		return fmt.Sprintf("测试完成: 从该源获取到 %d 个代理，其中 %d 个有效。", len(proxies), len(validProxies)), nil
-	}
-	return fmt.Sprintf("测试完成: 从该源获取到 %d 个代理，但没有有效代理。", len(proxies)), nil
+	return a.sourceManager.TestSource(source)
 }
 
 // ToggleRotation 切换代理轮换状态
@@ -503,6 +559,15 @@ func (a *App) SetRotationInterval(seconds int) {
 func (a *App) SaveConfig() error {
 	a.mutex.RLock()
 	defer a.mutex.RUnlock()
+	// 确保配置对象包含所有最新值
+	a.config.MaxLatency = a.maxLatency
+	a.config.MinSpeed = a.minSpeed
+	a.config.RotationInterval = a.rotationInterval
+	a.config.ThemeName = a.themeName
+	a.config.ProxySources = a.sourceManager.GetSources()
+	a.config.ProxyMode = a.proxyMode
+	a.config.HealthCheckInterval = a.healthCheckInterval
+	a.config.AllowedCountries = a.allowedCountries
 	return config.SaveConfig(a.config)
 }
 

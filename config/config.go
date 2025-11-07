@@ -11,21 +11,27 @@ import (
 
 // AppConfig 应用程序配置结构体
 type AppConfig struct {
-	MaxLatency       float64               `json:"max_latency"`
-	MinSpeed         float64               `json:"min_speed"`
-	RotationInterval int                   `json:"rotation_interval"`
-	ThemeName        string                `json:"theme_name"`
-	ProxySources     []fetcher.ProxySource `json:"proxy_sources"`
+	MaxLatency         float64               `json:"max_latency"`
+	MinSpeed           float64               `json:"min_speed"`
+	RotationInterval   int                   `json:"rotation_interval"`
+	ThemeName          string                `json:"theme_name"`
+	ProxySources       []fetcher.ProxySource `json:"proxy_sources"`
+	ProxyMode          string                `json:"proxy_mode"`          // 代理模式: per_request 或 fixed
+	HealthCheckInterval int                  `json:"health_check_interval"` // 健康检查间隔（分钟）
+	AllowedCountries   []string              `json:"allowed_countries"`   // 允许的国家列表
 }
 
 // NewDefaultConfig 创建默认配置
 func NewDefaultConfig() *AppConfig {
 	return &AppConfig{
-		MaxLatency:       -1,    // No limit
-		MinSpeed:         -1,    // No limit
-		RotationInterval: 60,    // 60 seconds
-		ThemeName:        "自定义", // Default theme
-		ProxySources:     fetcher.GetDefaultSources(),
+		MaxLatency:         -1,    // No limit
+		MinSpeed:           -1,    // No limit
+		RotationInterval:   60,    // 60 seconds
+		ThemeName:          "自定义", // Default theme
+		ProxySources:       fetcher.GetDefaultSources(),
+		ProxyMode:          "fixed", // 默认使用固定模式
+		HealthCheckInterval: 5,     // 默认5分钟检查一次
+		AllowedCountries:   []string{}, // 默认不限制国家
 	}
 }
 
